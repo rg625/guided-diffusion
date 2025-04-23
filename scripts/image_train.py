@@ -20,7 +20,7 @@ def main():
     args = create_argparser().parse_args()
 
     dist_util.setup_dist()
-    logger.configure()
+    logger.configure(dir="/home/rg625/models/unconditional/cifar10")
 
     logger.log("creating model and diffusion...")
     model, diffusion = create_model_and_diffusion(
@@ -59,7 +59,8 @@ def main():
 
 def create_argparser():
     defaults = dict(
-        data_dir="",
+        data_dir="/home/rg625/datasets/cifar10/images/",
+        image_size=32,
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0,
@@ -77,7 +78,6 @@ def create_argparser():
     parser = argparse.ArgumentParser()
     add_dict_to_argparser(parser, defaults)
     return parser
-
 
 if __name__ == "__main__":
     main()

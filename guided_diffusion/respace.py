@@ -112,6 +112,97 @@ class SpacedDiffusion(GaussianDiffusion):
         # Scaling is done by the wrapped model.
         return t
 
+class GuidedDiffusionModel(SpacedDiffusion, th.nn.Module):
+    def __init__(self, unet_model, encoder_unet_model, unet_ckpt=None, use_timesteps=None, **kwargs):
+        if use_timesteps is None:
+            raise ValueError("Must provide use_timesteps to initialize SpacedDiffusion.")
+        th.nn.Module.__init__(self)           # <-- Initialize PyTorch module system first
+        SpacedDiffusion.__init__(self, use_timesteps=use_timesteps, **kwargs)  # <-- Then init the diffusion base class        
+        self.unet_model = unet_model
+        self.encoder_unet_model = encoder_unet_model
+
+        if unet_ckpt is not None:
+            self.load_pretrained(unet_ckpt)
+            for param in self.unet_model.parameters():
+                param.requires_grad = False
+        else:
+            raise ValueError("Cannot train encoder without unconditional model")
+
+    def load_pretrained(self, path):
+        state = th.load(path, map_location="cpu")
+        print(f"Loading pretrained weights from {path}, step: {state.get('global_step', 'N/A')}")
+        self.unet_model.load_state_dict(state, strict=True)
+
+    def guided_sample(self, x, t, x_start, guidance_scale=1.0):
+        """
+        Apply classifier-free guidance during sampling.
+        Uses the gradient of the encoder's log-density to steer the diffusion process.
+        """
+        # Get the p_mean_var (mean, variance, and log variance)
+        p_mean_var = self.p_mean_variance(x, t)
+
+        # Compute the guidance score (∇ log p(x|z))
+        z = self.encode(x_start)['cond_fn']
+        score_grad = self.score(x_start, z, t)
+
+        # Adjust the mean with the gradient (guidance)
+        new_mean = p_mean_var['mean'] + guidance_scale * score_grad
+
+        return {
+            'mean': new_mean,
+            'variance': p_mean_var['variance'],
+            'log_variance': p_mean_var['log_variance']
+        }
+
+    def encode(self, x_start, t=None):
+        """
+        Encoder for conditioning. Using the encoder as the first half of the U-Net.
+        """
+        if t is None:
+            t = th.zeros(x_start.shape[0]).type_as(x_start)
+
+        latent_distribution_parameters = self.encoder_unet_model(x_start, t)
+
+        channels = latent_distribution_parameters.size(1) // 2
+        mean_z = latent_distribution_parameters[:, :channels]
+        log_var_z = latent_distribution_parameters[:, channels:]
+
+        cond = mean_z + (0.5 * log_var_z).exp() * th.randn_like(mean_z)
+
+        return {
+            'cond_fn': cond,
+            'mu': mean_z,
+            'logvar': log_var_z
+        }
+
+    def log_density(self, x, z, t):
+        """
+        Log density for latent variable.
+        """
+        latent_distribution_parameters = self.encoder_unet_model(x, t)
+        channels = latent_distribution_parameters.size(1) // 2
+        mean_z = latent_distribution_parameters[:, :channels]
+        log_var_z = latent_distribution_parameters[:, channels:]
+
+        mean_z_flat = mean_z.view(mean_z.size(0), -1)
+        log_var_z_flat = log_var_z.view(log_var_z.size(0), -1)
+        z_flat = z.view(z.size(0), -1)
+
+        logdensity = -0.5 * th.sum(th.square(z_flat - mean_z_flat) / log_var_z_flat.exp(), dim=1)
+        return logdensity
+
+    def score(self, x, z, t):
+        """
+        Computes the score function for classifier-free guidance.
+        """
+        device = x.device
+        x.requires_grad = True
+        ftx = self.log_density(x, z, t)
+        grad_log_density = th.autograd.grad(outputs=ftx, inputs=x,
+                                                grad_outputs=th.ones(ftx.size()).to(device),
+                                                create_graph=True, retain_graph=True, only_inputs=True)[0]
+        assert grad_log_density.size() == x.size()
+        return grad_log_density
 
 class _WrappedModel:
     def __init__(self, model, timestep_map, rescale_timesteps, original_num_steps):

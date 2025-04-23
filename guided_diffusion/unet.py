@@ -835,25 +835,26 @@ class EncoderUNetModel(nn.Module):
                 normalization(ch),
                 nn.SiLU(),
                 AttentionPool2d(
-                    (image_size // ds), ch, num_head_channels, out_channels
+                    (image_size // ds), ch, num_head_channels, 2*self._feature_size
                 ),
             )
         elif pool == "spatial":
             self.out = nn.Sequential(
                 nn.Linear(self._feature_size, 2048),
                 nn.ReLU(),
-                nn.Linear(2048, self.out_channels),
+                nn.Linear(2048, 2*self._feature_size),
             )
         elif pool == "spatial_v2":
             self.out = nn.Sequential(
                 nn.Linear(self._feature_size, 2048),
                 normalization(2048),
                 nn.SiLU(),
-                nn.Linear(2048, self.out_channels),
+                nn.Linear(2048, 2*self._feature_size),
             )
         else:
             raise NotImplementedError(f"Unexpected {pool} pooling")
-
+        
+        
     def convert_to_fp16(self):
         """
         Convert the torso of the model to float16.
@@ -892,3 +893,4 @@ class EncoderUNetModel(nn.Module):
         else:
             h = h.type(x.dtype)
             return self.out(h)
+        

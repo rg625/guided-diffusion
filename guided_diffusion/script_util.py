@@ -1,12 +1,10 @@
 import argparse
 import inspect
-
 from . import gaussian_diffusion as gd
-from .respace import SpacedDiffusion, space_timesteps
+from .respace import SpacedDiffusion, space_timesteps, GuidedDiffusionModel
 from .unet import SuperResModel, UNetModel, EncoderUNetModel
 
 NUM_CLASSES = 1000
-
 
 def diffusion_defaults():
     """
@@ -29,7 +27,7 @@ def classifier_defaults():
     Defaults for classifier models.
     """
     return dict(
-        image_size=64,
+        image_size=32,
         classifier_use_fp16=False,
         classifier_width=128,
         classifier_depth=2,
@@ -45,7 +43,7 @@ def model_and_diffusion_defaults():
     Defaults for image training.
     """
     res = dict(
-        image_size=64,
+        image_size=32,
         num_channels=128,
         num_res_blocks=2,
         num_heads=4,
@@ -127,6 +125,97 @@ def create_model_and_diffusion(
     return model, diffusion
 
 
+def create_guided_model_and_diffusion(
+    image_size,
+    class_cond,
+    learn_sigma,
+    num_channels,
+    num_res_blocks,
+    channel_mult,
+    num_heads,
+    num_head_channels,
+    num_heads_upsample,
+    attention_resolutions,
+    dropout,
+    diffusion_steps,
+    noise_schedule,
+    timestep_respacing,
+    use_kl,
+    predict_xstart,
+    rescale_timesteps,
+    rescale_learned_sigmas,
+    use_checkpoint,
+    use_scale_shift_norm,
+    resblock_updown,
+    use_fp16,
+    use_new_attention_order,
+    classifier_pool="attention",
+    unet_ckpt="/home/rg625/models/unconditional/cifar10/ema_0.9999_020000.pt",
+):
+    # 1. Create U-Net (base model)
+    unet_model = create_model(
+        image_size=image_size,
+        num_channels=num_channels,
+        num_res_blocks=num_res_blocks,
+        channel_mult=channel_mult,
+        learn_sigma=learn_sigma,
+        class_cond=class_cond,
+        use_checkpoint=use_checkpoint,
+        attention_resolutions=attention_resolutions,
+        num_heads=num_heads,
+        num_head_channels=num_head_channels,
+        num_heads_upsample=num_heads_upsample,
+        use_scale_shift_norm=use_scale_shift_norm,
+        dropout=dropout,
+        resblock_updown=resblock_updown,
+        use_fp16=use_fp16,
+        use_new_attention_order=use_new_attention_order,
+    )
+
+    # 2. Create Encoder UNet (used in encoder-based guidance)
+    encoder_unet_model = create_classifier(
+        image_size=image_size,
+        classifier_use_fp16=use_fp16,
+        classifier_width=num_channels,
+        classifier_depth=num_res_blocks,
+        classifier_attention_resolutions=attention_resolutions,
+        classifier_use_scale_shift_norm=use_scale_shift_norm,
+        classifier_resblock_updown=resblock_updown,
+        classifier_pool=classifier_pool,
+    )
+
+    # 3. Prepare diffusion schedule
+    betas = gd.get_named_beta_schedule(noise_schedule, diffusion_steps)
+
+    # 4. Get strided timestep indices (for spacing)
+    if timestep_respacing:
+        use_timesteps = space_timesteps(diffusion_steps, timestep_respacing)
+    else:
+        use_timesteps = set(range(diffusion_steps))
+
+    # 5. Pack kwargs for diffusion model
+    diffusion_kwargs = dict(
+        betas=betas,
+        model_mean_type="eps" if not predict_xstart else "x_start",
+        model_var_type=(
+            "learned_range" if rescale_learned_sigmas else "learned"
+            if learn_sigma else "fixed_large"
+        ),
+        loss_type="kl" if use_kl else "mse",
+        rescale_timesteps=rescale_timesteps,
+    )
+
+    # 6. Instantiate guided diffusion model
+    guided_diffusion_model = GuidedDiffusionModel(
+        unet_model=unet_model,
+        encoder_unet_model=encoder_unet_model,
+        unet_ckpt=unet_ckpt,
+        use_timesteps=use_timesteps,
+        **diffusion_kwargs,
+    )
+
+    return guided_diffusion_model
+
 def create_model(
     image_size,
     num_channels,
@@ -152,7 +241,8 @@ def create_model(
             channel_mult = (1, 1, 2, 2, 4, 4)
         elif image_size == 128:
             channel_mult = (1, 1, 2, 3, 4)
-        elif image_size == 64:
+        elif image_size in [64, 32]:
+        # elif image_size == 64:
             channel_mult = (1, 2, 3, 4)
         else:
             raise ValueError(f"unsupported image size: {image_size}")
@@ -241,7 +331,7 @@ def create_classifier(
         channel_mult = (1, 1, 2, 2, 4, 4)
     elif image_size == 128:
         channel_mult = (1, 1, 2, 3, 4)
-    elif image_size == 64:
+    elif image_size in [64, 32]:
         channel_mult = (1, 2, 3, 4)
     else:
         raise ValueError(f"unsupported image size: {image_size}")
@@ -259,6 +349,7 @@ def create_classifier(
         attention_resolutions=tuple(attention_ds),
         channel_mult=channel_mult,
         use_fp16=classifier_use_fp16,
+        use_checkpoint=False,
         num_head_channels=64,
         use_scale_shift_norm=classifier_use_scale_shift_norm,
         resblock_updown=classifier_resblock_updown,
