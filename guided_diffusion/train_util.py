@@ -7,7 +7,9 @@ import torch as th
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
+import numpy as np
 
+from .losses import normal_kl
 from . import dist_util, logger
 from .fp16_util import MixedPrecisionTrainer
 from .nn import update_ema
@@ -17,7 +19,6 @@ from .resample import LossAwareSampler, UniformSampler
 # We found that the lg_loss_scale quickly climbed to
 # 20-21 within the first ~1K steps of training.
 INITIAL_LOG_LOSS_SCALE = 20.0
-
 
 class TrainLoop:
     def __init__(
@@ -293,9 +294,122 @@ def find_ema_checkpoint(main_checkpoint, step, rate):
 
 
 def log_loss_dict(diffusion, ts, losses):
+    """
+    Log the loss dictionary with quantile-specific logging for time steps.
+
+    :param diffusion: The diffusion model (used for num_timesteps).
+    :param ts: Tensors representing the time steps.
+    :param losses: Dictionary of loss tensors.
+    """
     for key, values in losses.items():
+        # Log the mean of the loss
         logger.logkv_mean(key, values.mean().item())
+
+        # Ensure ts and values are iterable
+        ts = ts.view(-1) if ts.dim() == 0 else ts
+        values = values.view(-1) if values.dim() == 0 else values
+
         # Log the quantiles (four quartiles, in particular).
         for sub_t, sub_loss in zip(ts.cpu().numpy(), values.detach().cpu().numpy()):
             quartile = int(4 * sub_t / diffusion.num_timesteps)
             logger.logkv_mean(f"{key}_q{quartile}", sub_loss)
+
+
+class TrainGuidanceLoop(TrainLoop):
+    """
+    TrainGuidanceLoop inherits from TrainLoop and updates the forward_backward method
+    to compute the ScoreVAE loss with guidance.
+    """
+    def __init__(
+        self,
+        *,
+        model,
+        diffusion,
+        data,
+        batch_size,
+        microbatch,
+        lr,
+        ema_rate,
+        log_interval,
+        save_interval,
+        resume_checkpoint,
+        use_fp16=False,
+        fp16_scale_growth=1e-3,
+        schedule_sampler=None,
+        weight_decay=0.0,
+        lr_anneal_steps=0,
+        beta=1.0,  # Weight for KL divergence in the loss
+    ):
+        super().__init__(
+            model=model,
+            diffusion=diffusion,
+            data=data,
+            batch_size=batch_size,
+            microbatch=microbatch,
+            lr=lr,
+            ema_rate=ema_rate,
+            log_interval=log_interval,
+            save_interval=save_interval,
+            resume_checkpoint=resume_checkpoint,
+            use_fp16=use_fp16,
+            fp16_scale_growth=fp16_scale_growth,
+            schedule_sampler=schedule_sampler,
+            weight_decay=weight_decay,
+            lr_anneal_steps=lr_anneal_steps,
+        )
+        self.beta = beta  # KL divergence weight
+
+    def forward_backward(self, batch, cond):
+        """
+        Compute the forward and backward pass with the ScoreVAE loss.
+        """
+        self.mp_trainer.zero_grad()
+        for i in range(0, batch.shape[0], self.microbatch):
+            micro = batch[i : i + self.microbatch].to(dist_util.dev())
+            micro_cond = {
+                k: v[i : i + self.microbatch].to(dist_util.dev())
+                for k, v in cond.items()
+            }
+            last_batch = (i + self.microbatch) >= batch.shape[0]
+            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+
+            # 1. Diffuse x_0 to x_t
+            x_t = self.diffusion.q_sample(micro, t)
+
+            # 2. Compute unconditional score sθ(x_t, t)
+            with th.no_grad():
+                data_prior_score = self.model.unet_model(x_t, t)
+
+            # 3. Compute latent posterior score ∇x log q(z | x_t)
+            latent_distribution = self.model.encode(x_t, t)
+            z = latent_distribution["cond_fn"]
+            latent_posterior_score = self.model.score(x_t, z, t)
+
+            # 4. Combine scores to get the conditional score
+            conditional_score = data_prior_score + latent_posterior_score
+
+            # 5. Compute target score ∇x log p_t(x_t | x_0)
+            with th.no_grad():
+                target_score = self.diffusion._predict_xstart_from_eps(x_t, t, data_prior_score)
+
+            # 6. Compute ScoreVAE loss
+            g_t = np.sqrt(self.diffusion.betas[t]) if hasattr(self.diffusion, "betas") else 1.0
+            score_loss = (g_t**2 * (target_score - conditional_score).square().sum(dim=[1, 2, 3])).mean()
+
+            # 7. Compute KL divergence KL(q(z|x_0) || p(z))
+            kl_loss = normal_kl(
+                latent_distribution["mu"], latent_distribution["logvar"], 0, 0
+            ).mean()
+
+            # Combine losses
+            total_loss = score_loss + self.beta * kl_loss
+            log_loss_dict(
+                self.diffusion, t, {"score_loss": score_loss, "kl_loss": kl_loss}
+            )
+
+            # Gradient computation
+            if last_batch or not self.use_ddp:
+                self.mp_trainer.backward(total_loss)
+            else:
+                with self.ddp_model.no_sync():
+                    self.mp_trainer.backward(total_loss)

@@ -13,26 +13,25 @@ from guided_diffusion.script_util import (
     args_to_dict,
     add_dict_to_argparser,
 )
-import torch
+from guided_diffusion.train_util import TrainGuidanceLoop
+
 
 def main():
     args = create_argparser().parse_args()
-    dist_util.setup_dist()
-    logger.configure()
 
-    logger.log("Creating model and diffusion...")
-    model = create_guided_model_and_diffusion(
-        **args_to_dict(args, model_and_diffusion_defaults().keys())
+    dist_util.setup_dist()
+    logger.configure(dir=args.log_dir)
+
+    logger.log("creating model and diffusion...")
+
+    model, diffusion = create_guided_model_and_diffusion(
+        **args_to_dict(args, model_and_diffusion_defaults().keys()),
+        unet_ckpt=args.unet_ckpt  # Pass unet_ckpt explicitly
     )
     model.to(dist_util.dev())
-    model.unet_model.eval()  # freeze unconditional model
-    for p in model.unet_model.parameters():
-        p.requires_grad = False
+    schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
-    logger.log("Creating schedule sampler...")
-    schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, model)
-
-    logger.log("Loading data...")
+    logger.log("creating data loader...")
     data = load_data(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
@@ -40,69 +39,44 @@ def main():
         class_cond=args.class_cond,
     )
 
-    logger.log("Training encoder using ScoreVAE loss...")
-    optimizer = torch.optim.Adam(model.encoder_unet_model.parameters(), lr=args.lr)
+    logger.log("training...")
+    TrainGuidanceLoop(
+        model=model,
+        diffusion=diffusion,
+        data=data,
+        batch_size=args.batch_size,
+        microbatch=args.microbatch,
+        lr=args.lr,
+        ema_rate=args.ema_rate,
+        log_interval=args.log_interval,
+        save_interval=args.save_interval,
+        resume_checkpoint=args.resume_checkpoint,
+        use_fp16=args.use_fp16,
+        fp16_scale_growth=args.fp16_scale_growth,
+        schedule_sampler=schedule_sampler,
+        weight_decay=args.weight_decay,
+        lr_anneal_steps=args.lr_anneal_steps,
+    ).run_loop()
 
-    for step, batch in enumerate(data):
-        x_start = batch[0].to(dist_util.dev())
-        t, weights = schedule_sampler.sample(x_start.shape[0], dist_util.dev())
-
-        # 1. Diffuse input images to time t
-        x_t = model.q_sample(x_start, t)
-
-        # 2. Compute unconditional score sθ(x_t, t)
-        x_t.requires_grad = True
-        with torch.no_grad():
-            score_torcheta = model.unet_model(x_t, t)
-
-        # 3. Sample latent z ~ q(z|x_t) and compute ∇x log q(z | x_t)
-        encoded = model.encode(x_t, t)
-        z = encoded['cond_fn']
-        grad_log_q = model.score(x_t, z, t)
-
-        # 4. Combine scores
-        score_phi = score_torcheta + grad_log_q
-
-        # 5. Compute target score ∇x log p_t(x_t | x_0)
-        with torch.no_grad():
-            target_score = model._predict_xstart_from_eps(x_t, t, score_torcheta)  # Optional, depends on model
-
-        # 6. Compute ScoreVAE loss
-        g_t = model.g(t) if hasattr(model, "g") else 1.0
-
-        # Main guidance loss
-        score_loss = (g_t**2 * (target_score - score_phi).square().sum(dim=[1, 2, 3])).mean()
-
-        # 7. Compute KL(q(z|x_0) || p(z)) for z ~ q(z | x_0)
-        z_dist = model.encode(x_start)['cond_fn']
-        mu, logvar = encoded['mu'], encoded['logvar']
-        kl = 0.5 * torch.sum(mu.pow(2) + logvar.exp() - logvar - 1, dim=-1)
-        kl_loss = kl.mean()
-
-        total_loss = score_loss + args.beta * kl_loss
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
-
-        if step % args.log_interval == 0:
-            logger.log(f"step {step}: score_loss={score_loss.item():.4f}, kl={kl_loss.item():.4f}")
-
-        if step % args.save_interval == 0:
-            logger.save_model("encoder_checkpoint.pt", model.encoder_unet_model)
 
 def create_argparser():
     defaults = dict(
         data_dir="/home/rg625/datasets/cifar10/images/",
+        log_dir="/home/rg625/models/unconditional/cifar10",
         image_size=32,
         schedule_sampler="uniform",
         lr=1e-4,
-        beta=1.0,
-        batch_size=64,
+        weight_decay=0.0,
+        lr_anneal_steps=0,
+        batch_size=1,
+        microbatch=-1,  # -1 disables microbatches
+        ema_rate="0.9999",  # comma-separated list of EMA values
         log_interval=10,
         save_interval=10000,
-        class_cond=False,
+        resume_checkpoint="",
         use_fp16=False,
-        use_checkpoint=False,
+        fp16_scale_growth=1e-3,
+        unet_ckpt="/home/rg625/models/unconditional/cifar10/ema_0.9999_080000.pt"
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

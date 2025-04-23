@@ -1,8 +1,8 @@
 import argparse
 import inspect
 from . import gaussian_diffusion as gd
-from .respace import SpacedDiffusion, space_timesteps, GuidedDiffusionModel
-from .unet import SuperResModel, UNetModel, EncoderUNetModel
+from .respace import SpacedDiffusion, space_timesteps, GuidedDiffusion
+from .unet import SuperResModel, UNetModel, EncoderUNetModel, ScoreVAE
 
 NUM_CLASSES = 1000
 
@@ -149,9 +149,10 @@ def create_guided_model_and_diffusion(
     resblock_updown,
     use_fp16,
     use_new_attention_order,
+    unet_ckpt,
     classifier_pool="attention",
-    unet_ckpt="/home/rg625/models/unconditional/cifar10/ema_0.9999_020000.pt",
 ):
+
     # 1. Create U-Net (base model)
     unet_model = create_model(
         image_size=image_size,
@@ -184,37 +185,21 @@ def create_guided_model_and_diffusion(
         classifier_pool=classifier_pool,
     )
 
-    # 3. Prepare diffusion schedule
-    betas = gd.get_named_beta_schedule(noise_schedule, diffusion_steps)
+    scorevae = ScoreVAE(unet_model=unet_model, encoder_unet_model=encoder_unet_model, unet_ckpt=unet_ckpt)
 
-    # 4. Get strided timestep indices (for spacing)
-    if timestep_respacing:
-        use_timesteps = space_timesteps(diffusion_steps, timestep_respacing)
-    else:
-        use_timesteps = set(range(diffusion_steps))
-
-    # 5. Pack kwargs for diffusion model
-    diffusion_kwargs = dict(
-        betas=betas,
-        model_mean_type="eps" if not predict_xstart else "x_start",
-        model_var_type=(
-            "learned_range" if rescale_learned_sigmas else "learned"
-            if learn_sigma else "fixed_large"
-        ),
-        loss_type="kl" if use_kl else "mse",
+    guided_diffusion = create_guided_diffusion(
+        scorevae=scorevae,
+        steps=diffusion_steps,
+        learn_sigma=learn_sigma,
+        noise_schedule=noise_schedule,
+        use_kl=use_kl,
+        predict_xstart=predict_xstart,
         rescale_timesteps=rescale_timesteps,
+        rescale_learned_sigmas=rescale_learned_sigmas,
+        timestep_respacing=timestep_respacing,
     )
 
-    # 6. Instantiate guided diffusion model
-    guided_diffusion_model = GuidedDiffusionModel(
-        unet_model=unet_model,
-        encoder_unet_model=encoder_unet_model,
-        unet_ckpt=unet_ckpt,
-        use_timesteps=use_timesteps,
-        **diffusion_kwargs,
-    )
-
-    return guided_diffusion_model
+    return scorevae, guided_diffusion
 
 def create_model(
     image_size,
@@ -473,6 +458,47 @@ def sr_create_model(
         use_fp16=use_fp16,
     )
 
+def create_guided_diffusion(
+    *,
+    scorevae,
+    steps=1000,
+    learn_sigma=False,
+    sigma_small=False,
+    noise_schedule="linear",
+    use_kl=False,
+    predict_xstart=False,
+    rescale_timesteps=False,
+    rescale_learned_sigmas=False,
+    timestep_respacing="",
+):
+    betas = gd.get_named_beta_schedule(noise_schedule, steps)
+    if use_kl:
+        loss_type = gd.LossType.RESCALED_KL
+    elif rescale_learned_sigmas:
+        loss_type = gd.LossType.RESCALED_MSE
+    else:
+        loss_type = gd.LossType.MSE
+    if not timestep_respacing:
+        timestep_respacing = [steps]
+    return GuidedDiffusion(
+        score_vae = scorevae,
+        use_timesteps=space_timesteps(steps, timestep_respacing),
+        betas=betas,
+        model_mean_type=(
+            gd.ModelMeanType.EPSILON if not predict_xstart else gd.ModelMeanType.START_X
+        ),
+        model_var_type=(
+            (
+                gd.ModelVarType.FIXED_LARGE
+                if not sigma_small
+                else gd.ModelVarType.FIXED_SMALL
+            )
+            if not learn_sigma
+            else gd.ModelVarType.LEARNED_RANGE
+        ),
+        loss_type=loss_type,
+        rescale_timesteps=rescale_timesteps,
+    )
 
 def create_gaussian_diffusion(
     *,
