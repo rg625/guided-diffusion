@@ -368,26 +368,23 @@ class TrainGuidanceLoop(TrainLoop):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
-            model_kwargs = {
-                'x_zero': micro,
-            }
+
             # 1. Diffuse x_0 to x_t
             x_t = self.diffusion.q_sample(micro, t)
 
             # 2. Compute unconditional score sθ(x_t, t)
             with th.no_grad():
-                data_prior_score = self.model.unet_model(x_t, t)
-                target_score = self.diffusion._predict_xstart_from_eps(x_t, t, data_prior_score)
+                data_prior_eps = self.model.unet_model(x_t, t)
+                target_score = self.diffusion._predict_xstart_from_eps(x_t, t, data_prior_eps)
+            
             # 3. Compute latent posterior score ∇x log q(z | x_t)
-            latent_distribution = self.model(x_t, t, **model_kwargs)
-            conditional_score = latent_distribution["conditional_score"]
+            conditional_score = self.model(x_t, t)
 
             # 4. Compute ScoreVAE loss
-            # g_t = np.sqrt(self.diffusion.betas[t]) if hasattr(self.diffusion, "betas") else 1.0
             score_loss = (weights**2 * (target_score - conditional_score).square().sum(dim=[1, 2, 3])).mean()
 
             # 7. Compute KL divergence KL(q(z|x_0) || p(z))
-            zeroth_distribution = self.model.encode(x_zero=micro, t = th.zeros_like(t, device=t.device))
+            zeroth_distribution = self.model.encode(x_t=micro, t = th.zeros_like(t, device=t.device))
             kl_loss = normal_kl(
                 zeroth_distribution["mu"], zeroth_distribution["logvar"], 0, 0
             ).mean()

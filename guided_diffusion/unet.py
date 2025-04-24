@@ -932,6 +932,7 @@ class ScoreVAE(th.nn.Module):
         print(f"Loading pretrained weights from {path}, step: {state.get('global_step', 'N/A')}")
         self.unet_model.load_state_dict(state, strict=True)
 
+    
     def forward(self, x_t, t, **model_kwargs):
         """
         Compute the conditional data score using Bayes' rule for scores.
@@ -941,20 +942,9 @@ class ScoreVAE(th.nn.Module):
         :param model_kwargs: Should include 'x_zero' and optionally 'guidance_scale'.
         :return: Conditional data score and KL divergence.
         """
-        x_zero = model_kwargs.get("x_zero", None)
+        
         guidance_scale = model_kwargs.get("guidance_scale", 1.0)
-
-        if not self.sampling:
-            if x_zero is None:
-                raise ValueError("x_zero must be provided in model_kwargs for conditional encoding.")
-            else:
-                zeroth_encodings = self.encode(x_zero, th.zeros_like(t, device = t.device))
-        else:
-            x_zero = th.randn_like(x_t, device = x_t.device)
-        # Step 1: Compute latent posterior score ∇xt ln p(z|xt)
-        latent_distribution = self.encode(x_t, t)
-        z = latent_distribution['cond_fn']
-        latent_posterior_score = self.score(x_t, z, t)
+        latent_posterior_score = self.guidance_score(x_t, t)
 
         # Step 2: Compute data prior score ∇xt ln p(xt) using pretrained unconditional model
         data_prior_score = self.unet_model(x_t, t)
@@ -962,23 +952,18 @@ class ScoreVAE(th.nn.Module):
         # Step 3: Combine scores using Bayes' rule
         conditional_score = data_prior_score + guidance_scale * latent_posterior_score
         
-        # Step 4: Compute the KL divergence for the encoder
-        kl_div = self.kl_divergence(zeroth_encodings['mu'], zeroth_encodings['logvar']) if not self.sampling else None
+        return conditional_score
 
-        return {
-            'conditional_score': conditional_score,
-            'kl_divergence': kl_div
-        } if not self.sampling else conditional_score
-
-    def encode(self, x_zero, t):
+    def encode(self, x_t, t):
         """
         Encoder network to compute latent posterior parameters and sample z.
 
-        :param x_zero: Input tensor (x_0).
+        :param x_t: Input tensor (x_t).
         :param t: Time step tensor.
         :return: Dictionary with latent variables and distributions.
         """
-        latent_distribution_parameters = self.encoder_unet_model(x_zero, t)
+        latent_distribution_parameters = self.encoder_unet_model(x_t, t)
+        # print(f'latent_distribution_parameters.requires_grad:{latent_distribution_parameters.requires_grad}')
 
         channels = latent_distribution_parameters.size(1) // 2
         mean_z = latent_distribution_parameters[:, :channels]
@@ -988,46 +973,38 @@ class ScoreVAE(th.nn.Module):
         cond = mean_z + (0.5 * log_var_z).exp() * th.randn_like(mean_z)
 
         return {
-            'cond_fn': cond,
+            'encoding': cond,
             'mu': mean_z,
             'logvar': log_var_z
         }
 
-    def score(self, x, z, t):
-        x = x.clone().detach().requires_grad_(True)
+    def guidance_score(self, x_t, t):
+        x_t = x_t.clone().detach().requires_grad_(True)
+
+        latent_sample = self.encode(x_t, t)
+
+        mu = latent_sample["mu"]
+        log_var = latent_sample["logvar"]
+        z = latent_sample["encoding"]
+
         with th.enable_grad():
-            log_q = self.log_density(x, z, t)
+            log_q = self.log_density(z, mu, log_var)
+
         return th.autograd.grad(
-            outputs=log_q, inputs=x,
+            outputs=log_q, inputs=x_t,
             grad_outputs=th.ones_like(log_q),
             create_graph=True, retain_graph=True, only_inputs=True
         )[0]
 
-    def log_density(self, x, z, t):
+    def log_density(self, z, mu, log_var):
         """
         Compute the log density of the latent posterior q(z|xt).
 
-        :param x: Input tensor (x_t).
+        :param x_t: Input tensor (x_t).
         :param z: Latent variable.
         :param t: Time step tensor.
         :return: Log density of q(z|xt).
         """
-        latent_distribution_parameters = self.encoder_unet_model(x, t)
-        channels = latent_distribution_parameters.size(1) // 2
-        mean_z = latent_distribution_parameters[:, :channels]
-        log_var_z = latent_distribution_parameters[:, channels:]
-
-        log_density = -0.5 * th.sum((z - mean_z).pow(2) / log_var_z.exp() + log_var_z, dim=1)
+        log_density = -0.5 * th.sum((z - mu).pow(2) / log_var.exp() + log_var, dim=1)
         return log_density
-
-    def kl_divergence(self, mu, logvar):
-        """
-        Compute the KL divergence between q(z|x) and p(z).
-
-        :param mu: Mean of the latent distribution.
-        :param logvar: Log variance of the latent distribution.
-        :return: Scalar KL divergence value.
-        """
-        kl = -0.5 * th.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-        return th.mean(kl)
     

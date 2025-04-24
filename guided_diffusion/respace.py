@@ -117,32 +117,13 @@ class GuidedDiffusion(SpacedDiffusion):
     A guided diffusion process where the guidance is provided by ScoreVAE.
 
     :param score_vae: An instance of the ScoreVAE model.
-    :param kwargs: Additional arguments to initialize the SpacedDiffusion base class.
+    :param use_timesteps: A list of timesteps to retain.
+    :param kwargs: Additional arguments for the base SpacedDiffusion class.
     """
-
     def __init__(self, score_vae, use_timesteps, **kwargs):
-        self.score_vae = score_vae  # Store the ScoreVAE instance
+        self.score_vae = score_vae
         super().__init__(use_timesteps=use_timesteps, **kwargs)
 
-    def _wrap_model(self, model):
-        """
-        Wrap the ScoreVAE model to inject guidance at each step.
-        This replaces the default UNet in the sampling process.
-        """
-        if isinstance(model, _WrappedModel):
-            return model
-
-        def guided_model_fn(x_t, t):
-            # Ensure ScoreVAE is in sampling mode
-            self.score_vae.sampling = True
-            return self.score_vae(x_t, t, guidance_scale=1.0)
-
-        return _WrappedModel(
-            guided_model_fn,
-            self.timestep_map,
-            self.rescale_timesteps,
-            self.original_num_steps
-        )
 
 class _WrappedModel:
     def __init__(self, model, timestep_map, rescale_timesteps, original_num_steps):
