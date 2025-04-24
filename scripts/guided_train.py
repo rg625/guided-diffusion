@@ -62,13 +62,13 @@ def main():
 def create_argparser():
     defaults = dict(
         data_dir="/home/rg625/datasets/cifar10/images/",
-        log_dir="/home/rg625/models/unconditional/cifar10",
+        log_dir="/home/rg625/models/conditional/cifar10",
         image_size=32,
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        batch_size=1,
+        batch_size=128,
         microbatch=-1,  # -1 disables microbatches
         ema_rate="0.9999",  # comma-separated list of EMA values
         log_interval=10,
@@ -76,7 +76,7 @@ def create_argparser():
         resume_checkpoint="",
         use_fp16=False,
         fp16_scale_growth=1e-3,
-        unet_ckpt="/home/rg625/models/unconditional/cifar10/ema_0.9999_080000.pt"
+        unet_ckpt="/home/rg625/models/unconditional/cifar10/ema_0.9999_200000.pt"
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

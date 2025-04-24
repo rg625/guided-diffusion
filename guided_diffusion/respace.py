@@ -124,26 +124,25 @@ class GuidedDiffusion(SpacedDiffusion):
         self.score_vae = score_vae  # Store the ScoreVAE instance
         super().__init__(use_timesteps=use_timesteps, **kwargs)
 
-    def condition_mean(self, cond_fn, x_t, t, *args, **kwargs):
+    def _wrap_model(self, model):
         """
-        Override condition_mean to use ScoreVAE's guidance.
-
-        :param cond_fn: The conditioning function to be used.
-        :param x_t: The current noisy input at time `t`.
-        :param t: The time step at which the guidance is applied.
-        :return: The conditionally guided mean.
+        Wrap the ScoreVAE model to inject guidance at each step.
+        This replaces the default UNet in the sampling process.
         """
-        # Use ScoreVAE's encode method to get latent variables
-        latent_distribution = self.score_vae.encode(x_t, t)
-        z = latent_distribution['cond_fn']
+        if isinstance(model, _WrappedModel):
+            return model
 
-        # Use ScoreVAE's guidance to adjust the mean
-        condition_mean = super().condition_mean(cond_fn, x_t, t, *args, **kwargs)
-        guidance_score = self.score_vae.score(x_t, z, t)
+        def guided_model_fn(x_t, t):
+            # Ensure ScoreVAE is in sampling mode
+            self.score_vae.sampling = True
+            return self.score_vae(x_t, t, guidance_scale=1.0)
 
-        # Apply guidance to modify the mean
-        guided_mean = condition_mean + kwargs.get("guidance_scale", 1.0) * guidance_score
-        return guided_mean
+        return _WrappedModel(
+            guided_model_fn,
+            self.timestep_map,
+            self.rescale_timesteps,
+            self.original_num_steps
+        )
 
 class _WrappedModel:
     def __init__(self, model, timestep_map, rescale_timesteps, original_num_steps):

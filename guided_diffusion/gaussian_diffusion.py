@@ -326,6 +326,8 @@ class GaussianDiffusion:
         }
 
     def _predict_xstart_from_eps(self, x_t, t, eps):
+        # print(f'x_t: {x_t}')
+        # print(f'eps: {eps}')
         assert x_t.shape == eps.shape
         return (
             _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
@@ -366,6 +368,7 @@ class GaussianDiffusion:
         new_mean = (
             p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float()
         )
+        print(f'new_mean" {new_mean}')
         return new_mean
 
     def condition_score(self, cond_fn, p_mean_var, x, t, model_kwargs=None):

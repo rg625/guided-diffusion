@@ -905,13 +905,18 @@ class ScoreVAE(th.nn.Module):
     :param use_timesteps: Timesteps for the diffusion process.
     :param kwargs: Additional arguments for the model.
     """
-    def __init__(self, unet_model, encoder_unet_model, unet_ckpt=None, **kwargs):
+    def __init__(self, 
+                 unet_model: UNetModel, 
+                 encoder_unet_model: EncoderUNetModel, 
+                 unet_ckpt: str = None, 
+                 **kwargs):
         super().__init__()
 
-        self.unet_model = unet_model
-        self.encoder_unet_model = encoder_unet_model
+        self.unet_model: UNetModel = unet_model
+        self.encoder_unet_model: EncoderUNetModel = encoder_unet_model
 
         # Load pretrained unconditional model and freeze its parameters
+        self.sampling = False
         if unet_ckpt is not None:
             self.load_pretrained(unet_ckpt)
             for param in self.unet_model.parameters():
@@ -927,19 +932,25 @@ class ScoreVAE(th.nn.Module):
         print(f"Loading pretrained weights from {path}, step: {state.get('global_step', 'N/A')}")
         self.unet_model.load_state_dict(state, strict=True)
 
-    def forward(self, x_t, t, x_start=None, guidance_scale=1.0):
+    def forward(self, x_t, t, **model_kwargs):
         """
         Compute the conditional data score using Bayes' rule for scores.
 
         :param x_t: Noisy input at time `t`.
         :param t: Time step tensor.
-        :param x_start: Optional original data sample `x_0` for encoding.
-        :param guidance_scale: Scale for classifier-free guidance.
+        :param model_kwargs: Should include 'x_zero' and optionally 'guidance_scale'.
         :return: Conditional data score and KL divergence.
         """
-        if x_start is None:
-            raise ValueError("x_start must be provided for conditional encoding.")
+        x_zero = model_kwargs.get("x_zero", None)
+        guidance_scale = model_kwargs.get("guidance_scale", 1.0)
 
+        if not self.sampling:
+            if x_zero is None:
+                raise ValueError("x_zero must be provided in model_kwargs for conditional encoding.")
+            else:
+                zeroth_encodings = self.encode(x_zero, th.zeros_like(t, device = t.device))
+        else:
+            x_zero = th.randn_like(x_t, device = x_t.device)
         # Step 1: Compute latent posterior score ∇xt ln p(z|xt)
         latent_distribution = self.encode(x_t, t)
         z = latent_distribution['cond_fn']
@@ -950,24 +961,24 @@ class ScoreVAE(th.nn.Module):
 
         # Step 3: Combine scores using Bayes' rule
         conditional_score = data_prior_score + guidance_scale * latent_posterior_score
-
+        
         # Step 4: Compute the KL divergence for the encoder
-        kl_div = self.kl_divergence(latent_distribution['mu'], latent_distribution['logvar'])
+        kl_div = self.kl_divergence(zeroth_encodings['mu'], zeroth_encodings['logvar']) if not self.sampling else None
 
         return {
             'conditional_score': conditional_score,
             'kl_divergence': kl_div
-        }
+        } if not self.sampling else conditional_score
 
-    def encode(self, x_start, t):
+    def encode(self, x_zero, t):
         """
         Encoder network to compute latent posterior parameters and sample z.
 
-        :param x_start: Input tensor (x_0).
+        :param x_zero: Input tensor (x_0).
         :param t: Time step tensor.
         :return: Dictionary with latent variables and distributions.
         """
-        latent_distribution_parameters = self.encoder_unet_model(x_start, t)
+        latent_distribution_parameters = self.encoder_unet_model(x_zero, t)
 
         channels = latent_distribution_parameters.size(1) // 2
         mean_z = latent_distribution_parameters[:, :channels]
@@ -983,20 +994,14 @@ class ScoreVAE(th.nn.Module):
         }
 
     def score(self, x, z, t):
-        """
-        Compute the latent posterior score ∇xt ln p(z|xt).
-
-        :param x: Input tensor (x_t).
-        :param z: Latent variable.
-        :param t: Time step tensor.
-        :return: Latent posterior score.
-        """
-        x.requires_grad = True
-        log_q = self.log_density(x, z, t)
-        grad_log_density = th.autograd.grad(outputs=log_q, inputs=x,
-                                            grad_outputs=th.ones_like(log_q),
-                                            create_graph=True, retain_graph=True, only_inputs=True)[0]
-        return grad_log_density
+        x = x.clone().detach().requires_grad_(True)
+        with th.enable_grad():
+            log_q = self.log_density(x, z, t)
+        return th.autograd.grad(
+            outputs=log_q, inputs=x,
+            grad_outputs=th.ones_like(log_q),
+            create_graph=True, retain_graph=True, only_inputs=True
+        )[0]
 
     def log_density(self, x, z, t):
         """

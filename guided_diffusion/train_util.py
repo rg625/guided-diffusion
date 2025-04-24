@@ -366,39 +366,30 @@ class TrainGuidanceLoop(TrainLoop):
         self.mp_trainer.zero_grad()
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
-            micro_cond = {
-                k: v[i : i + self.microbatch].to(dist_util.dev())
-                for k, v in cond.items()
-            }
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
-
+            model_kwargs = {
+                'x_zero': micro,
+            }
             # 1. Diffuse x_0 to x_t
             x_t = self.diffusion.q_sample(micro, t)
 
             # 2. Compute unconditional score sθ(x_t, t)
             with th.no_grad():
                 data_prior_score = self.model.unet_model(x_t, t)
-
-            # 3. Compute latent posterior score ∇x log q(z | x_t)
-            latent_distribution = self.model.encode(x_t, t)
-            z = latent_distribution["cond_fn"]
-            latent_posterior_score = self.model.score(x_t, z, t)
-
-            # 4. Combine scores to get the conditional score
-            conditional_score = data_prior_score + latent_posterior_score
-
-            # 5. Compute target score ∇x log p_t(x_t | x_0)
-            with th.no_grad():
                 target_score = self.diffusion._predict_xstart_from_eps(x_t, t, data_prior_score)
+            # 3. Compute latent posterior score ∇x log q(z | x_t)
+            latent_distribution = self.model(x_t, t, **model_kwargs)
+            conditional_score = latent_distribution["conditional_score"]
 
-            # 6. Compute ScoreVAE loss
-            g_t = np.sqrt(self.diffusion.betas[t]) if hasattr(self.diffusion, "betas") else 1.0
-            score_loss = (g_t**2 * (target_score - conditional_score).square().sum(dim=[1, 2, 3])).mean()
+            # 4. Compute ScoreVAE loss
+            # g_t = np.sqrt(self.diffusion.betas[t]) if hasattr(self.diffusion, "betas") else 1.0
+            score_loss = (weights**2 * (target_score - conditional_score).square().sum(dim=[1, 2, 3])).mean()
 
             # 7. Compute KL divergence KL(q(z|x_0) || p(z))
+            zeroth_distribution = self.model.encode(x_zero=micro, t = th.zeros_like(t, device=t.device))
             kl_loss = normal_kl(
-                latent_distribution["mu"], latent_distribution["logvar"], 0, 0
+                zeroth_distribution["mu"], zeroth_distribution["logvar"], 0, 0
             ).mean()
 
             # Combine losses
