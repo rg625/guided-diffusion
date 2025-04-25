@@ -1,7 +1,7 @@
 import argparse
 import inspect
 from . import gaussian_diffusion as gd
-from .respace import SpacedDiffusion, space_timesteps, GuidedDiffusion
+from .respace import SpacedDiffusion, space_timesteps
 from .unet import SuperResModel, UNetModel, EncoderUNetModel, ScoreVAE
 
 NUM_CLASSES = 1000
@@ -187,8 +187,8 @@ def create_guided_model_and_diffusion(
 
     scorevae = ScoreVAE(unet_model=unet_model, encoder_unet_model=encoder_unet_model, unet_ckpt=unet_ckpt)
 
-    guided_diffusion = create_guided_diffusion(
-        scorevae=scorevae,
+    guided_diffusion = create_gaussian_diffusion(
+        # scorevae=scorevae,
         steps=diffusion_steps,
         learn_sigma=learn_sigma,
         noise_schedule=noise_schedule,
@@ -456,48 +456,6 @@ def sr_create_model(
         use_scale_shift_norm=use_scale_shift_norm,
         resblock_updown=resblock_updown,
         use_fp16=use_fp16,
-    )
-
-def create_guided_diffusion(
-    *,
-    scorevae,
-    steps=1000,
-    learn_sigma=False,
-    sigma_small=False,
-    noise_schedule="linear",
-    use_kl=False,
-    predict_xstart=False,
-    rescale_timesteps=False,
-    rescale_learned_sigmas=False,
-    timestep_respacing="",
-):
-    betas = gd.get_named_beta_schedule(noise_schedule, steps)
-    if use_kl:
-        loss_type = gd.LossType.RESCALED_KL
-    elif rescale_learned_sigmas:
-        loss_type = gd.LossType.RESCALED_MSE
-    else:
-        loss_type = gd.LossType.MSE
-    if not timestep_respacing:
-        timestep_respacing = [steps]
-    return GuidedDiffusion(
-        score_vae = scorevae,
-        use_timesteps=space_timesteps(steps, timestep_respacing),
-        betas=betas,
-        model_mean_type=(
-            gd.ModelMeanType.EPSILON if not predict_xstart else gd.ModelMeanType.START_X
-        ),
-        model_var_type=(
-            (
-                gd.ModelVarType.FIXED_LARGE
-                if not sigma_small
-                else gd.ModelVarType.FIXED_SMALL
-            )
-            if not learn_sigma
-            else gd.ModelVarType.LEARNED_RANGE
-        ),
-        loss_type=loss_type,
-        rescale_timesteps=rescale_timesteps,
     )
 
 def create_gaussian_diffusion(

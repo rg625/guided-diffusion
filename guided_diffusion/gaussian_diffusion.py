@@ -521,7 +521,7 @@ class GaussianDiffusion:
 
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
-            with th.enable_grad():
+            with th.no_grad():
                 out = self.p_sample(
                     model,
                     img,

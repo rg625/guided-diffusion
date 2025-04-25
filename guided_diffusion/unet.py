@@ -934,33 +934,37 @@ class ScoreVAE(th.nn.Module):
         self.unet_model.load_state_dict(state, strict=True)
 
     
-    def prepare_for_sampling(self, shape, device):
+    def prepare_for_sampling(self, x_0):
         """
         Call this once before running the denoising loop during sampling.
-        Samples x_0 and computes the encoding z = eϕ(x_0, t=0), and stores it.
+        Samples x_0 and computes z, mu, logvar for log-density computation.
         """
-        x_0 = th.randn(shape, device=device)
-        t_zeros = th.zeros((x_0.size(0),), dtype=th.long, device=device)
+        t_zeros = th.zeros((x_0.size(0),), dtype=th.long, device=x_0.device)
         encoding = self.encode(x_0, t_zeros)
-        self.sample_encoding = encoding["encoding"]
+        self.sample_encoding = {
+            "encoding": encoding["encoding"],
+            "mu": encoding["mu"],
+            "logvar": encoding["logvar"]
+        }
 
     def forward(self, x_t, t, **model_kwargs):
         guidance_scale = model_kwargs.get("guidance_scale", 1.0)
+        x_0 = model_kwargs.get('x_start', None)
 
         if not self.sampling:
-            x_0 = model_kwargs.get('x_start', None)
             assert x_0 is not None, 'Need x_start to condition when training'
             encoding = self.encode(x_0, th.zeros_like(t, device=t.device))["encoding"]
         else:
             assert self.sample_encoding is not None, 'Call prepare_for_sampling() before sampling'
-            encoding = self.sample_encoding
+            encoding = self.sample_encoding["encoding"]
 
         latent_posterior_score = self.guidance_score(x_t, t, z=encoding)
 
         with th.no_grad():
             data_prior_score = self.unet_model(x_t, t)
 
-        conditional_score = data_prior_score + guidance_scale * latent_posterior_score
+        conditional_score = data_prior_score + 10000 * latent_posterior_score
+        # print(latent_posterior_score)
 
         # Cleanup (optional)
         del data_prior_score, latent_posterior_score
@@ -993,23 +997,30 @@ class ScoreVAE(th.nn.Module):
         }
 
     def guidance_score(self, x_t, t, z):
+        # Ensure x_t is a leaf with grad enabled
         x_t = x_t.clone().detach().requires_grad_(True)
 
-        latent_sample = self.encode(x_t, t)
+        # Run encoder with grad enabled so mu/log_var depend on x_t
+        with th.set_grad_enabled(True):
+            latent_sample = self.encode(x_t, t)
+            mu = latent_sample["mu"]
+            log_var = latent_sample["logvar"]
 
-        mu = latent_sample["mu"]
-        log_var = latent_sample["logvar"]
-
-        with th.enable_grad():
+            # Compute log density of z under q(z | x_t)
             log_q = self.log_density(z, mu, log_var)
 
-        score =  th.autograd.grad(
-            outputs=log_q, inputs=x_t,
-            grad_outputs=th.ones_like(log_q),
-            create_graph=False, retain_graph=False, only_inputs=True
-        )[0]
-        del log_q, mu, log_var, latent_sample
+            # Compute gradient of log_q w.r.t. x_t
+            score = th.autograd.grad(
+                outputs=log_q,
+                inputs=x_t,
+                grad_outputs=th.ones_like(log_q),
+                create_graph=False,
+                retain_graph=False,
+                only_inputs=True
+            )[0]
+
         return score
+        # del log_q, mu, log_var, latent_sample
 
 
     def log_density(self, z, mu, log_var):

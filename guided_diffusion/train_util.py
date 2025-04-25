@@ -338,7 +338,7 @@ class TrainGuidanceLoop(TrainLoop):
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        beta=0.01,  # Weight for KL divergence in the loss
+        beta=1.,  # Weight for KL divergence in the loss
     ):
         super().__init__(
             model=model,
@@ -394,7 +394,7 @@ class TrainGuidanceLoop(TrainLoop):
 
             conds = self.model.encode(micro_cond['x_start'].to(t.device), th.zeros_like(t, device=t.device))
             loss_kl = self.beta * normal_kl(mean1=conds['mu'], logvar1=conds['logvar'], mean2=0, logvar2=0).sum(dim=-1)
-            loss = (losses["loss"] * weights + loss_kl).mean()
+            loss = (0.5*losses["loss"] * weights + loss_kl).mean()
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )

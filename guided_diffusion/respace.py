@@ -112,18 +112,6 @@ class SpacedDiffusion(GaussianDiffusion):
         # Scaling is done by the wrapped model.
         return t
 
-class GuidedDiffusion(SpacedDiffusion):
-    """
-    A guided diffusion process where the guidance is provided by ScoreVAE.
-
-    :param score_vae: An instance of the ScoreVAE model.
-    :param use_timesteps: A list of timesteps to retain.
-    :param kwargs: Additional arguments for the base SpacedDiffusion class.
-    """
-    def __init__(self, score_vae, use_timesteps, **kwargs):
-        self.score_vae = score_vae
-        super().__init__(use_timesteps=use_timesteps, **kwargs)
-
 
 class _WrappedModel:
     def __init__(self, model, timestep_map, rescale_timesteps, original_num_steps):
@@ -138,3 +126,4 @@ class _WrappedModel:
         if self.rescale_timesteps:
             new_ts = new_ts.float() * (1000.0 / self.original_num_steps)
         return self.model(x, new_ts, **kwargs)
+    
