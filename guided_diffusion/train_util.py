@@ -338,7 +338,7 @@ class TrainGuidanceLoop(TrainLoop):
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        beta=1.0,  # Weight for KL divergence in the loss
+        beta=0.01,  # Weight for KL divergence in the loss
     ):
         super().__init__(
             model=model,
@@ -360,44 +360,42 @@ class TrainGuidanceLoop(TrainLoop):
         self.beta = beta  # KL divergence weight
 
     def forward_backward(self, batch, cond):
-        """
-        Compute the forward and backward pass with the ScoreVAE loss.
-        """
         self.mp_trainer.zero_grad()
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
+
+            micro_cond = (
+                {"x_start": batch}
+                if not cond
+                else {k: v[i : i + self.microbatch].to(dist_util.dev()) for k, v in cond.items()}
+            )
+                
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
-            # 1. Diffuse x_0 to x_t
-            x_t = self.diffusion.q_sample(micro, t)
-
-            # 2. Compute unconditional score sθ(x_t, t)
-            with th.no_grad():
-                data_prior_eps = self.model.unet_model(x_t, t)
-                target_score = self.diffusion._predict_xstart_from_eps(x_t, t, data_prior_eps)
-            
-            # 3. Compute latent posterior score ∇x log q(z | x_t)
-            conditional_score = self.model(x_t, t)
-
-            # 4. Compute ScoreVAE loss
-            score_loss = (weights**2 * (target_score - conditional_score).square().sum(dim=[1, 2, 3])).mean()
-
-            # 7. Compute KL divergence KL(q(z|x_0) || p(z))
-            zeroth_distribution = self.model.encode(x_t=micro, t = th.zeros_like(t, device=t.device))
-            kl_loss = normal_kl(
-                zeroth_distribution["mu"], zeroth_distribution["logvar"], 0, 0
-            ).mean()
-
-            # Combine losses
-            total_loss = score_loss + self.beta * kl_loss
-            log_loss_dict(
-                self.diffusion, t, {"score_loss": score_loss, "kl_loss": kl_loss}
+            compute_losses = functools.partial(
+                self.diffusion.training_losses,
+                self.ddp_model,
+                micro,
+                t,
+                model_kwargs=micro_cond,
             )
 
-            # Gradient computation
             if last_batch or not self.use_ddp:
-                self.mp_trainer.backward(total_loss)
+                losses = compute_losses()
             else:
                 with self.ddp_model.no_sync():
-                    self.mp_trainer.backward(total_loss)
+                    losses = compute_losses()
+
+            if isinstance(self.schedule_sampler, LossAwareSampler):
+                self.schedule_sampler.update_with_local_losses(
+                    t, losses["loss"].detach()
+                )
+
+            conds = self.model.encode(micro_cond['x_start'].to(t.device), th.zeros_like(t, device=t.device))
+            loss_kl = self.beta * normal_kl(mean1=conds['mu'], logvar1=conds['logvar'], mean2=0, logvar2=0).sum(dim=-1)
+            loss = (losses["loss"] * weights + loss_kl).mean()
+            log_loss_dict(
+                self.diffusion, t, {k: v * weights for k, v in losses.items()}
+            )
+            self.mp_trainer.backward(loss)

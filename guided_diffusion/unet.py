@@ -915,8 +915,9 @@ class ScoreVAE(th.nn.Module):
         self.unet_model: UNetModel = unet_model
         self.encoder_unet_model: EncoderUNetModel = encoder_unet_model
 
-        # Load pretrained unconditional model and freeze its parameters
         self.sampling = False
+        self.sample_encoding = None  # <-- NEW: will hold z during sampling
+
         if unet_ckpt is not None:
             self.load_pretrained(unet_ckpt)
             for param in self.unet_model.parameters():
@@ -933,27 +934,40 @@ class ScoreVAE(th.nn.Module):
         self.unet_model.load_state_dict(state, strict=True)
 
     
+    def prepare_for_sampling(self, shape, device):
+        """
+        Call this once before running the denoising loop during sampling.
+        Samples x_0 and computes the encoding z = eϕ(x_0, t=0), and stores it.
+        """
+        x_0 = th.randn(shape, device=device)
+        t_zeros = th.zeros((x_0.size(0),), dtype=th.long, device=device)
+        encoding = self.encode(x_0, t_zeros)
+        self.sample_encoding = encoding["encoding"]
+
     def forward(self, x_t, t, **model_kwargs):
-        """
-        Compute the conditional data score using Bayes' rule for scores.
-
-        :param x_t: Noisy input at time `t`.
-        :param t: Time step tensor.
-        :param model_kwargs: Should include 'x_zero' and optionally 'guidance_scale'.
-        :return: Conditional data score and KL divergence.
-        """
-        
         guidance_scale = model_kwargs.get("guidance_scale", 1.0)
-        latent_posterior_score = self.guidance_score(x_t, t)
 
-        # Step 2: Compute data prior score ∇xt ln p(xt) using pretrained unconditional model
-        data_prior_score = self.unet_model(x_t, t)
+        if not self.sampling:
+            x_0 = model_kwargs.get('x_start', None)
+            assert x_0 is not None, 'Need x_start to condition when training'
+            encoding = self.encode(x_0, th.zeros_like(t, device=t.device))["encoding"]
+        else:
+            assert self.sample_encoding is not None, 'Call prepare_for_sampling() before sampling'
+            encoding = self.sample_encoding
 
-        # Step 3: Combine scores using Bayes' rule
+        latent_posterior_score = self.guidance_score(x_t, t, z=encoding)
+
+        with th.no_grad():
+            data_prior_score = self.unet_model(x_t, t)
+
         conditional_score = data_prior_score + guidance_scale * latent_posterior_score
-        
-        return conditional_score
 
+        # Cleanup (optional)
+        del data_prior_score, latent_posterior_score
+        th.cuda.empty_cache()
+
+        return conditional_score
+    
     def encode(self, x_t, t):
         """
         Encoder network to compute latent posterior parameters and sample z.
@@ -978,23 +992,25 @@ class ScoreVAE(th.nn.Module):
             'logvar': log_var_z
         }
 
-    def guidance_score(self, x_t, t):
+    def guidance_score(self, x_t, t, z):
         x_t = x_t.clone().detach().requires_grad_(True)
 
         latent_sample = self.encode(x_t, t)
 
         mu = latent_sample["mu"]
         log_var = latent_sample["logvar"]
-        z = latent_sample["encoding"]
 
         with th.enable_grad():
             log_q = self.log_density(z, mu, log_var)
 
-        return th.autograd.grad(
+        score =  th.autograd.grad(
             outputs=log_q, inputs=x_t,
             grad_outputs=th.ones_like(log_q),
-            create_graph=True, retain_graph=True, only_inputs=True
+            create_graph=False, retain_graph=False, only_inputs=True
         )[0]
+        del log_q, mu, log_var, latent_sample
+        return score
+
 
     def log_density(self, z, mu, log_var):
         """

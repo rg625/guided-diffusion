@@ -4,3 +4,4 @@ classify_image_graph_def.pb
 *.txt
 *.ipynb
 *.egg-info
+*.png
