@@ -6,6 +6,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+import copy
 
 from .fp16_util import convert_module_to_f16, convert_module_to_f32
 from .nn import (
@@ -854,6 +855,7 @@ class EncoderUNetModel(nn.Module):
         else:
             raise NotImplementedError(f"Unexpected {pool} pooling")
         
+        self.projection = nn.Linear(2*self._feature_size, 1024)
         
     def convert_to_fp16(self):
         """
@@ -889,10 +891,12 @@ class EncoderUNetModel(nn.Module):
         if self.pool.startswith("spatial"):
             results.append(h.type(x.dtype).mean(dim=(2, 3)))
             h = th.cat(results, axis=-1)
-            return self.out(h)
+            h = self.out(h)
+            return self.projection(h)
         else:
             h = h.type(x.dtype)
-            return self.out(h)
+            h = self.out(h)
+            return self.projection(h)
         
 
 class ScoreVAE(th.nn.Module):
@@ -909,21 +913,40 @@ class ScoreVAE(th.nn.Module):
                  unet_model: UNetModel, 
                  encoder_unet_model: EncoderUNetModel, 
                  unet_ckpt: str = None, 
+                 sigmas: np.array = None,
                  **kwargs):
         super().__init__()
 
         self.unet_model: UNetModel = unet_model
         self.encoder_unet_model: EncoderUNetModel = encoder_unet_model
-
+        self.sigmas = th.from_numpy(sigmas).float().view(-1, 1, 1, 1)
         self.sampling = False
-        self.sample_encoding = None  # <-- NEW: will hold z during sampling
+        self.sample_encoding = {
+            "prior_score": [],
+            "conditional_score": [],
+        }  # <-- NEW: will hold z during sampling
 
         if unet_ckpt is not None:
             self.load_pretrained(unet_ckpt)
             for param in self.unet_model.parameters():
                 param.requires_grad = False
+            for param in self.encoder_unet_model.parameters():
+                param.requires_grad = True
         else:
             raise ValueError("Cannot train encoder without a pretrained unconditional model")
+
+        for name, param in self.encoder_unet_model.named_parameters():
+            if not param.requires_grad:
+                print(f"[Frozen Parameter Detected]: {name}")
+
+        for m in self.encoder_unet_model.modules():
+            if isinstance(m, (th.nn.Linear, th.nn.Conv2d)):
+                th.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    th.nn.init.zeros_(m.bias)
+
+        self.encoder_unet_model.time_embed = copy.deepcopy(self.unet_model.time_embed)
+                
 
     def load_pretrained(self, path):
         """
@@ -932,8 +955,7 @@ class ScoreVAE(th.nn.Module):
         state = th.load(path, map_location="cpu")
         print(f"Loading pretrained weights from {path}, step: {state.get('global_step', 'N/A')}")
         self.unet_model.load_state_dict(state, strict=True)
-
-    
+ 
     def prepare_for_sampling(self, x_0):
         """
         Call this once before running the denoising loop during sampling.
@@ -941,36 +963,47 @@ class ScoreVAE(th.nn.Module):
         """
         t_zeros = th.zeros((x_0.size(0),), dtype=th.long, device=x_0.device)
         encoding = self.encode(x_0, t_zeros)
-        self.sample_encoding = {
+        return {
             "encoding": encoding["encoding"],
             "mu": encoding["mu"],
             "logvar": encoding["logvar"]
         }
-
+        
     def forward(self, x_t, t, **model_kwargs):
         guidance_scale = model_kwargs.get("guidance_scale", 1.0)
+        z_0 = model_kwargs.get('z_start', None)
         x_0 = model_kwargs.get('x_start', None)
 
-        if not self.sampling:
-            assert x_0 is not None, 'Need x_start to condition when training'
-            encoding = self.encode(x_0, th.zeros_like(t, device=t.device))["encoding"]
+        if z_0 is None:
+            assert x_0 is not None, "Need x_0 to compute z_start if not provided"
+            t_zeros = th.zeros((x_0.size(0),), dtype=th.long, device=x_0.device)
+            encoding = self.encode(x_0, t_zeros)
+            z_0 = encoding["encoding"]
+            model_kwargs["encoding"] = encoding  # Store mu/logvar for KL loss
         else:
-            assert self.sample_encoding is not None, 'Call prepare_for_sampling() before sampling'
-            encoding = self.sample_encoding["encoding"]
+            encoding = None  # Already provided
+        # for name, param in self.encoder_unet_model.named_parameters():
+        #     if not param.requires_grad:
+        #         print(f"[Frozen] {name}")
+        # for name, param in self.encoder_unet_model.named_parameters():
+        #     if param.grad is not None:
+        #         print(f"Grad norm for {name}: {param.grad.norm().item()}")
 
-        latent_posterior_score = self.guidance_score(x_t, t, z=encoding)
+        latent_posterior_score = self.guidance_score(x_t, t, z=z_0)
 
         with th.no_grad():
-            data_prior_score = self.unet_model(x_t, t)
+            data_prior_noise = self.unet_model(x_t, t)
 
-        conditional_score = data_prior_score + 10000 * latent_posterior_score
-        # print(latent_posterior_score)
+        conditional_noise = data_prior_noise - self.sigmas.to(t.device)[t] * guidance_scale * latent_posterior_score
 
         # Cleanup (optional)
-        del data_prior_score, latent_posterior_score
-        th.cuda.empty_cache()
+        if self.sampling:
+            # del data_prior_noise, latent_posterior_score
+            # th.cuda.empty_cache()
+            self.sample_encoding["prior_score"].append(-data_prior_noise/self.sigmas.to(t.device)[t])
+            self.sample_encoding["conditional_score"].append(latent_posterior_score)
 
-        return conditional_score
+        return conditional_noise
     
     def encode(self, x_t, t):
         """
@@ -980,13 +1013,7 @@ class ScoreVAE(th.nn.Module):
         :param t: Time step tensor.
         :return: Dictionary with latent variables and distributions.
         """
-        latent_distribution_parameters = self.encoder_unet_model(x_t, t)
-        # print(f'latent_distribution_parameters.requires_grad:{latent_distribution_parameters.requires_grad}')
-
-        channels = latent_distribution_parameters.size(1) // 2
-        mean_z = latent_distribution_parameters[:, :channels]
-        log_var_z = latent_distribution_parameters[:, channels:]
-
+        mean_z, log_var_z = self.encoder_unet_model(x_t, t).chunk(2)
         # Reparameterization trick
         cond = mean_z + (0.5 * log_var_z).exp() * th.randn_like(mean_z)
 
@@ -1007,21 +1034,20 @@ class ScoreVAE(th.nn.Module):
             log_var = latent_sample["logvar"]
 
             # Compute log density of z under q(z | x_t)
-            log_q = self.log_density(z, mu, log_var)
+            log_q = self.log_density(z, mu, log_var) + 1e-8
 
             # Compute gradient of log_q w.r.t. x_t
             score = th.autograd.grad(
                 outputs=log_q,
                 inputs=x_t,
                 grad_outputs=th.ones_like(log_q),
-                create_graph=False,
-                retain_graph=False,
+                create_graph=True,
+                retain_graph=True,
                 only_inputs=True
             )[0]
 
-        return score
+        return score 
         # del log_q, mu, log_var, latent_sample
-
 
     def log_density(self, z, mu, log_var):
         """
@@ -1032,6 +1058,10 @@ class ScoreVAE(th.nn.Module):
         :param t: Time step tensor.
         :return: Log density of q(z|xt).
         """
-        log_density = -0.5 * th.sum((z - mu).pow(2) / log_var.exp() + log_var, dim=1)
-        return log_density
+        return -0.5 * th.sum(
+            th.square(
+                z.view(mu.size(0), -1) - mu.view(mu.size(0), -1)
+                ) / log_var.view(log_var.size(0), -1).exp() + log_var.view(log_var.size(0), -1), 
+            dim=1
+            )
     

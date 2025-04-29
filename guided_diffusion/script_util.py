@@ -185,7 +185,6 @@ def create_guided_model_and_diffusion(
         classifier_pool=classifier_pool,
     )
 
-    scorevae = ScoreVAE(unet_model=unet_model, encoder_unet_model=encoder_unet_model, unet_ckpt=unet_ckpt)
 
     guided_diffusion = create_gaussian_diffusion(
         # scorevae=scorevae,
@@ -198,6 +197,12 @@ def create_guided_model_and_diffusion(
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
     )
+    scorevae = ScoreVAE(
+        unet_model=unet_model, 
+        encoder_unet_model=encoder_unet_model, 
+        unet_ckpt=unet_ckpt, 
+        sigmas=guided_diffusion.sqrt_one_minus_alphas_cumprod
+        )
 
     return scorevae, guided_diffusion
 

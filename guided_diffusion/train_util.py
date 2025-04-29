@@ -76,6 +76,10 @@ class TrainLoop:
         self.opt = AdamW(
             self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
         )
+        # # Print parameter names and attributes
+        # for name, param in self.model.named_parameters():
+        #     print(f"[Master Params] Param {name} requires_grad {param.requires_grad}")
+
         if self.resume_step:
             self._load_optimizer_state()
             # Model was resumed, either due to a restart or a checkpoint
@@ -171,12 +175,29 @@ class TrainLoop:
             self.save()
 
     def run_step(self, batch, cond):
+        # Sanity check: capture initial encoder params for comparison
+        encoder_params_before = {
+            name: param.clone().detach()
+            for name, param in self.ddp_model.module.named_parameters()
+            if param.requires_grad
+        }
+        # print(encoder_params_before)
         self.forward_backward(batch, cond)
         took_step = self.mp_trainer.optimize(self.opt)
         if took_step:
             self._update_ema()
         self._anneal_lr()
         self.log_step()
+        # Sanity check: compare params before and after backward
+        for name, param in self.ddp_model.module.named_parameters():
+            if param.requires_grad:
+                before = encoder_params_before[name]
+                after = param.detach()
+                if th.allclose(before, after, atol=1e-6):
+                    print(f"[Sanity Check] Param '{name}' did NOT change — check training config!")
+                else:
+                    pass
+                    
 
     def forward_backward(self, batch, cond):
         self.mp_trainer.zero_grad()
@@ -338,7 +359,7 @@ class TrainGuidanceLoop(TrainLoop):
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        beta=1.,  # Weight for KL divergence in the loss
+        beta=0.001,  # Weight for KL divergence in the loss
     ):
         super().__init__(
             model=model,
@@ -359,43 +380,85 @@ class TrainGuidanceLoop(TrainLoop):
         )
         self.beta = beta  # KL divergence weight
 
+        # model.print_model_summary()
+
+    def compute_losses(self, predicted_noise, true_noise):
+        # Ensure predicted_noise and true_noise require gradients
+        assert predicted_noise.requires_grad, "predicted_noise does not require gradients!"
+        assert true_noise.requires_grad, "true_noise does not require gradients!"
+
+        # Compute the MSE loss
+        losses = th.square(predicted_noise - true_noise)
+        losses = th.sum(losses.reshape(losses.shape[0], -1), dim=-1)
+        losses *= 1 / 2
+        return {
+            "loss": th.mean(losses)  # likelihood loss / reconstruction loss
+        }
+    
     def forward_backward(self, batch, cond):
+        """
+        Perform a forward and backward pass on the batch with optional conditioning.
+        
+        Args:
+            batch (torch.Tensor): Input batch of data.
+            cond (dict or None): Conditioning information if available.
+        """
+        device = dist_util.dev()
         self.mp_trainer.zero_grad()
-        for i in range(0, batch.shape[0], self.microbatch):
-            micro = batch[i : i + self.microbatch].to(dist_util.dev())
 
-            micro_cond = (
-                {"x_start": batch}
-                if not cond
-                else {k: v[i : i + self.microbatch].to(dist_util.dev()) for k, v in cond.items()}
-            )
-                
-            last_batch = (i + self.microbatch) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+        batch_size = batch.shape[0]
+        for start_idx in range(0, batch_size, self.microbatch):
+            end_idx = start_idx + self.microbatch
+            microbatch = batch[start_idx:end_idx].to(device)
+            is_last_microbatch = end_idx >= batch_size
 
-            compute_losses = functools.partial(
-                self.diffusion.training_losses,
-                self.ddp_model,
-                micro,
-                t,
-                model_kwargs=micro_cond,
-            )
+            # Sample time steps and their corresponding weights
+            t, weights = self.schedule_sampler.sample(microbatch.shape[0], device)
 
-            if last_batch or not self.use_ddp:
-                losses = compute_losses()
+            # Encode conditioning (if applicable)
+            encoding = self.ddp_model.module.encode(microbatch, th.zeros_like(t, device=t.device))
+            if not cond:
+                micro_cond = {
+                    # "z_start": encoding["encoding"],
+                    "z_start": None,
+                    "x_start": microbatch,
+                    }
+            else:
+                micro_cond = {k: v[start_idx:end_idx].to(device) for k, v in cond.items()}
+
+            # Sample perturbed inputs
+            noise = th.randn_like(microbatch, device=device, requires_grad=True)
+            perturbed_x = self.diffusion.q_sample(microbatch, t, noise=noise)
+
+            # Predict the noise
+            predicted_noise = self.ddp_model(perturbed_x, t, **micro_cond)
+
+            # Compute losses
+            if is_last_microbatch or not self.use_ddp:
+                losses = self.compute_losses(predicted_noise, noise)
             else:
                 with self.ddp_model.no_sync():
-                    losses = compute_losses()
+                    losses = self.compute_losses(predicted_noise, noise)
 
+            # If using a LossAwareSampler, update with observed losses
             if isinstance(self.schedule_sampler, LossAwareSampler):
-                self.schedule_sampler.update_with_local_losses(
-                    t, losses["loss"].detach()
-                )
+                self.schedule_sampler.update_with_local_losses(t, losses["loss"].detach())
 
-            conds = self.model.encode(micro_cond['x_start'].to(t.device), th.zeros_like(t, device=t.device))
-            loss_kl = self.beta * normal_kl(mean1=conds['mu'], logvar1=conds['logvar'], mean2=0, logvar2=0).sum(dim=-1)
-            loss = (0.5*losses["loss"] * weights + loss_kl).mean()
-            log_loss_dict(
-                self.diffusion, t, {k: v * weights for k, v in losses.items()}
-            )
-            self.mp_trainer.backward(loss)
+            # Compute KL divergence loss for the latent variables
+            mu, logvar = encoding['mu'], (encoding['logvar'] + 1e-8)
+            losses["kl_loss"] = -self.beta * 0.5 * th.sum(1 + logvar.view(logvar.size(0), -1)
+                                    - mu.view(mu.size(0), -1).pow(2)
+                                    - logvar.view(logvar.size(0), -1).exp(), dim=1).mean()
+
+            # Total loss = reconstruction loss + beta * KL loss
+            assert losses["loss"].requires_grad, "MSE loss does not require gradients!"
+            # assert losses["kl_loss"].requires_grad, "KL loss does not require gradients!"
+            total_loss = losses["loss"] + losses["kl_loss"]
+
+            # Logging
+            log_dict = {k: v * weights for k, v in losses.items()}
+            log_loss_dict(self.diffusion, t, log_dict)
+
+            # Backpropagate
+            self.mp_trainer.backward(total_loss)
+            
