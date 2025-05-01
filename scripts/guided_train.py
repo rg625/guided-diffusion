@@ -65,7 +65,7 @@ def create_argparser():
         log_dir="/home/rg625/models/conditional/cifar10",
         image_size=32,
         schedule_sampler="uniform",
-        lr=1e-3,
+        lr=1e-4,
         weight_decay=0.0,
         lr_anneal_steps=0,
         batch_size=128,

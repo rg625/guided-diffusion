@@ -172,11 +172,11 @@ class TrainLoop:
 
     def run_step(self, batch, cond):
         # # Sanity check: capture initial encoder params for comparison
-        # encoder_params_before = {
-        #     name: param.clone().detach()
-        #     for name, param in self.ddp_model.module.named_parameters()
-        #     if param.requires_grad
-        # }
+        encoder_params_before = {
+            name: param.clone().detach()
+            for name, param in self.ddp_model.module.named_parameters()
+            if param.requires_grad
+        }
         # print(encoder_params_before)
         self.forward_backward(batch, cond)
         took_step = self.mp_trainer.optimize(self.opt)
@@ -184,15 +184,15 @@ class TrainLoop:
             self._update_ema()
         self._anneal_lr()
         self.log_step()
-        # # Sanity check: compare params before and after backward
-        # for name, param in self.ddp_model.module.named_parameters():
-        #     if param.requires_grad:
-        #         before = encoder_params_before[name]
-        #         after = param.detach()
-        #         if th.allclose(before, after, atol=1e-6):
-        #             print(f"[Sanity Check] Param '{name}' did NOT change — check training config!")
-        #         else:
-        #             pass
+        # Sanity check: compare params before and after backward
+        for name, param in self.ddp_model.module.named_parameters():
+            if param.requires_grad:
+                before = encoder_params_before[name]
+                after = param.detach()
+                if th.allclose(before, after, atol=1e-6):
+                    print(f"[Sanity Check] Param '{name}' did NOT change — check training config!")
+                else:
+                    pass
                     
     def forward_backward(self, batch, cond):
         self.mp_trainer.zero_grad()
@@ -432,10 +432,11 @@ class TrainGuidanceLoop(TrainLoop):
                     micro_cond["z_start"] = encoding['encoding']
 
             # Sample perturbed inputs x_t ~ q(x_t | x_0)
-            noise = th.randn_like(microbatch, device=device, requires_grad=True)
-            # perturbed_x = self.diffusion.q_sample(microbatch, t, noise=noise)
+            noise = th.randn_like(microbatch, device=device)
+            perturbed_x = self.diffusion.q_sample(microbatch, t, noise=noise)
             # perturbed_x.requires_grad_(True)
-            perturbed_x = microbatch + th.from_numpy(self.diffusion.sqrt_one_minus_alphas_cumprod).float().view(-1, 1, 1, 1).to(t.device)[t]*noise
+            # perturbed_x = microbatch + th.from_numpy(self.diffusion.sqrt_one_minus_alphas_cumprod).float().view(-1, 1, 1, 1).to(t.device)[t]*noise
+            perturbed_x.requires_grad_(True)
             if self.debug:
                 # Check perturbed_x
                 print(f"DEBUG perturbed_x:")
@@ -452,7 +453,9 @@ class TrainGuidanceLoop(TrainLoop):
                     print(f"  {name}: grad_norm={grad_norm:.8f}")
 
             # Predict the noise using our ScoreVAE model
-            predicted_noise = self.ddp_model(perturbed_x, t, **micro_cond)
+            with th.no_grad():
+                pretrained_noise = self.ddp_model.module.unet_model(perturbed_x, t)
+            predicted_noise = -self.ddp_model(perturbed_x, t, **micro_cond)*th.from_numpy(self.diffusion.sqrt_one_minus_alphas_cumprod).float().view(-1, 1, 1, 1).to(t.device)[t]
             
             if self.debug:
                 # Check predicted_noise
@@ -471,10 +474,10 @@ class TrainGuidanceLoop(TrainLoop):
 
             # Compute loss between predicted noise and original noise
             if is_last_microbatch or not self.use_ddp:
-                losses = self.compute_losses(predicted_noise, noise)
+                losses = self.compute_losses(predicted_noise, noise - pretrained_noise)
             else:
                 with self.ddp_model.no_sync():
-                    losses = self.compute_losses(predicted_noise, noise)
+                    losses = self.compute_losses(predicted_noise, noise - pretrained_noise)
 
             # If using a LossAwareSampler, update with observed losses
             if isinstance(self.schedule_sampler, LossAwareSampler):
@@ -509,19 +512,3 @@ class TrainGuidanceLoop(TrainLoop):
                     if param.grad is not None:
                         grad_norm = param.grad.norm().item()
                     print(f"  {name}: grad_norm={grad_norm:.8f}")
-            
-    # def run_step(self, batch, cond):
-    #     """
-    #     Run a single training step.
-    #     """
-    #     # Forward and backward pass
-    #     self.forward_backward(batch, cond)
-        
-    #     # Take optimizer step
-    #     took_step = self.mp_trainer.optimize(self.opt)
-    #     if took_step:
-    #         # Update EMA parameters
-    #         self._update_ema()
-            
-    #     # Return loss metrics for logging
-    #     return took_step

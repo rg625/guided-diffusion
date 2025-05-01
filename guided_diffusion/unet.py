@@ -967,35 +967,35 @@ class ScoreVAE(th.nn.Module):
         
         assert z_0 is not None, 'Need z_start to condition when training'
         
-        # Get unconditional score from the pretrained model (no gradients needed)
-        with th.no_grad():
-            unconditional_score = self.unet_model(x_t, t)
+        # # Get unconditional score from the pretrained model (no gradients needed)
+        # with th.no_grad():
+        #     unconditional_score = self.unet_model(x_t, t)
         
-        guidance_gradients = self.guidance_score(x_t=x_t, t=t, z=z_0)
+        # guidance_gradients = self.guidance_score(x_t=x_t, t=t, z=z_0)
         
-        # Apply noise level scaling and guidance strength
-        sigma_t = self.sigmas.to(t.device)[t].view(-1, 1, 1, 1)
-        scaled_guidance = sigma_t * guidance_scale * guidance_gradients
+        # # Apply noise level scaling and guidance strength
+        # sigma_t = self.sigmas.to(t.device)[t].view(-1, 1, 1, 1)
+        # scaled_guidance = sigma_t * guidance_scale * guidance_gradients
         
-        # Combine with unconditional score
-        conditional_score = unconditional_score - scaled_guidance
+        # # Combine with unconditional score
+        # conditional_score = unconditional_score - scaled_guidance
         
-        if self.debug:
-            print(f"DEBUG in forward:")
-            # print(f"  - mu range: [{mu.min().item()}, {mu.max().item()}]")
-            # print(f"  - log_var range: [{log_var.min().item()}, {log_var.max().item()}]")
-            # print(f"  - log_density: {log_density.mean().item()}")
-            print(f"  - guidance_gradients norm: {guidance_gradients.norm().item()}")
-            print(f"  - scaled_guidance norm: {scaled_guidance.norm().item()}")
-            print(f"  - unconditional_score norm: {unconditional_score.norm().item()}")
-            print(f"  - conditional_score norm: {conditional_score.norm().item()}")
+        # if self.debug:
+        #     print(f"DEBUG in forward:")
+        #     # print(f"  - mu range: [{mu.min().item()}, {mu.max().item()}]")
+        #     # print(f"  - log_var range: [{log_var.min().item()}, {log_var.max().item()}]")
+        #     # print(f"  - log_density: {log_density.mean().item()}")
+        #     print(f"  - guidance_gradients norm: {guidance_gradients.norm().item()}")
+        #     print(f"  - scaled_guidance norm: {scaled_guidance.norm().item()}")
+        #     print(f"  - unconditional_score norm: {unconditional_score.norm().item()}")
+        #     print(f"  - conditional_score norm: {conditional_score.norm().item()}")
         
-        # Store for sampling if needed
-        if self.sampling:
-            self.sample_encoding["prior_score"].append(-unconditional_score/sigma_t)
-            self.sample_encoding["conditional_score"].append(guidance_gradients)
+        # # Store for sampling if needed
+        # if self.sampling:
+        #     self.sample_encoding["prior_score"].append(-unconditional_score/sigma_t)
+        #     self.sample_encoding["conditional_score"].append(guidance_gradients)
         
-        return conditional_score
+        return guidance_scale * self.guidance_score(x_t=x_t, t=t, z=z_0)
     
     def guidance_score(self, x_t, t, z):
         x_t.requires_grad_(True)
@@ -1008,35 +1008,23 @@ class ScoreVAE(th.nn.Module):
         # Split the output into mean and log variance
         mu, log_var = latent_params.chunk(2, dim=1)
         
-        # Compute log density (negative energy) of z_0 under q(z|x_t)
-        z_flat = z.reshape(z.size(0), -1)
-        mu_flat = mu.reshape(mu.size(0), -1)
-        log_var_flat = log_var.reshape(log_var.size(0), -1)
-        
-        # Terms inside the sum for log density
-        precision = (-log_var_flat).exp()  # 1/variance
-        diff_squared = (z_flat - mu_flat).pow(2)
-        
         # We need gradients to flow from these terms back to the encoder parameters
-        log_density_terms = -0.5 * (diff_squared * precision + log_var_flat)
-        log_density = log_density_terms.sum(dim=1)
+        log_density =self.log_density(z=z, mu=mu, log_var=log_var)
         # Clear intermediate tensors that are not needed after computation
-        del latent_params, mu, log_var, z_flat, mu_flat, log_var_flat, precision, diff_squared, log_density_terms
+        del latent_params, mu, log_var
 
         # Clear the cache to release unused memory
-        th.cuda.empty_cache()
+        if self.sampling:
+            th.cuda.empty_cache()
         # Compute gradient of log density w.r.t. x_t
-        # This is where the magic happens - we use autograd to get ∇_x log q(z|x_t)
         grad_outputs = th.ones_like(log_density)
         return th.autograd.grad(
             outputs=log_density,
             inputs=x_t,
             grad_outputs=grad_outputs,
-            create_graph=not self.sampling,  # Crucial for higher-order gradients
+            create_graph=not self.sampling,
             retain_graph=not self.sampling,
         )[0]
-        
-        
     
     def encode(self, x_t, t):
         """Encode x_t to get latent distribution parameters and sample z."""
