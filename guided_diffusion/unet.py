@@ -222,19 +222,20 @@ class ResBlock(TimestepBlock):
         else:
             self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
 
+    # def forward(self, x, emb):
+    #     """
+    #     Apply the block to a Tensor, conditioned on a timestep embedding.
+
+    #     :param x: an [N x C x ...] Tensor of features.
+    #     :param emb: an [N x emb_channels] Tensor of timestep embeddings.
+    #     :return: an [N x C x ...] Tensor of outputs.
+    #     """
+    #     return checkpoint(
+    #         self._forward, (x, emb), self.parameters(), self.use_checkpoint
+    #     )
+
+    # def _forward(self, x, emb):
     def forward(self, x, emb):
-        """
-        Apply the block to a Tensor, conditioned on a timestep embedding.
-
-        :param x: an [N x C x ...] Tensor of features.
-        :param emb: an [N x emb_channels] Tensor of timestep embeddings.
-        :return: an [N x C x ...] Tensor of outputs.
-        """
-        return checkpoint(
-            self._forward, (x, emb), self.parameters(), self.use_checkpoint
-        )
-
-    def _forward(self, x, emb):
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -294,10 +295,11 @@ class AttentionBlock(nn.Module):
 
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
+    # def forward(self, x):
+    #     return checkpoint(self._forward, (x,), self.parameters(), True)
+    
+    # def _forward(self, x):
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)
-
-    def _forward(self, x):
         b, c, *spatial = x.shape
         x = x.reshape(b, c, -1)
         qkv = self.qkv(self.norm(x))
@@ -836,26 +838,26 @@ class EncoderUNetModel(nn.Module):
                 normalization(ch),
                 nn.SiLU(),
                 AttentionPool2d(
-                    (image_size // ds), ch, num_head_channels, 2*self._feature_size
+                    (image_size // ds), ch, num_head_channels, self._feature_size
                 ),
             )
         elif pool == "spatial":
             self.out = nn.Sequential(
                 nn.Linear(self._feature_size, 2048),
                 nn.ReLU(),
-                nn.Linear(2048, 2*self._feature_size),
+                nn.Linear(2048, self._feature_size),
             )
         elif pool == "spatial_v2":
             self.out = nn.Sequential(
                 nn.Linear(self._feature_size, 2048),
                 normalization(2048),
                 nn.SiLU(),
-                nn.Linear(2048, 2*self._feature_size),
+                nn.Linear(2048, self._feature_size),
             )
         else:
             raise NotImplementedError(f"Unexpected {pool} pooling")
         
-        self.projection = nn.Linear(2*self._feature_size, 1024)
+        self.projection = nn.Linear(self._feature_size, 1024)
         
     def convert_to_fp16(self):
         """
@@ -901,19 +903,14 @@ class EncoderUNetModel(nn.Module):
 
 class ScoreVAE(th.nn.Module):
     """
-    A ScoreVAE model with an encoder network and a pretrained unconditional diffusion model.
-
-    :param unet_model: Pretrained unconditional diffusion model (sθ).
-    :param encoder_unet_model: Encoder network (eφ) for latent posterior approximation.
-    :param unet_ckpt: Path to the pretrained weights for the unconditional model.
-    :param use_timesteps: Timesteps for the diffusion process.
-    :param kwargs: Additional arguments for the model.
+    A ScoreVAE model with direct integration between the encoder and guidance.
     """
     def __init__(self, 
                  unet_model: UNetModel, 
                  encoder_unet_model: EncoderUNetModel, 
                  unet_ckpt: str = None, 
                  sigmas: np.array = None,
+                 debug=False,
                  **kwargs):
         super().__init__()
 
@@ -921,46 +918,35 @@ class ScoreVAE(th.nn.Module):
         self.encoder_unet_model: EncoderUNetModel = encoder_unet_model
         self.sigmas = th.from_numpy(sigmas).float().view(-1, 1, 1, 1)
         self.sampling = False
+        self.debug = debug
         self.sample_encoding = {
             "prior_score": [],
             "conditional_score": [],
-        }  # <-- NEW: will hold z during sampling
+        }
 
         if unet_ckpt is not None:
             self.load_pretrained(unet_ckpt)
+            # Freeze the unconditional model parameters
             for param in self.unet_model.parameters():
                 param.requires_grad = False
-            for param in self.encoder_unet_model.parameters():
-                param.requires_grad = True
         else:
             raise ValueError("Cannot train encoder without a pretrained unconditional model")
-
-        for name, param in self.encoder_unet_model.named_parameters():
-            if not param.requires_grad:
-                print(f"[Frozen Parameter Detected]: {name}")
-
-        for m in self.encoder_unet_model.modules():
-            if isinstance(m, (th.nn.Linear, th.nn.Conv2d)):
-                th.nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    th.nn.init.zeros_(m.bias)
-
+        
+        # Copy the time embedding layer from the unconditional model
         self.encoder_unet_model.time_embed = copy.deepcopy(self.unet_model.time_embed)
-                
+        
+        # Ensure encoder parameters are trainable
+        for param in self.encoder_unet_model.parameters():
+            param.requires_grad = True
 
     def load_pretrained(self, path):
-        """
-        Load pretrained weights for the unconditional U-Net model.
-        """
+        """Load pretrained weights for the unconditional model."""
         state = th.load(path, map_location="cpu")
         print(f"Loading pretrained weights from {path}, step: {state.get('global_step', 'N/A')}")
         self.unet_model.load_state_dict(state, strict=True)
  
     def prepare_for_sampling(self, x_0):
-        """
-        Call this once before running the denoising loop during sampling.
-        Samples x_0 and computes z, mu, logvar for log-density computation.
-        """
+        """Prepare for sampling by encoding x_0."""
         t_zeros = th.zeros((x_0.size(0),), dtype=th.long, device=x_0.device)
         encoding = self.encode(x_0, t_zeros)
         return {
@@ -970,98 +956,111 @@ class ScoreVAE(th.nn.Module):
         }
         
     def forward(self, x_t, t, **model_kwargs):
+        """
+        Combined forward pass for the ScoreVAE model.
+        
+        This implementation directly computes both the unconditional score and the
+        guidance term in a single forward pass, ensuring proper gradient flow.
+        """
         guidance_scale = model_kwargs.get("guidance_scale", 1.0)
         z_0 = model_kwargs.get('z_start', None)
-        x_0 = model_kwargs.get('x_start', None)
-
-        if z_0 is None:
-            assert x_0 is not None, "Need x_0 to compute z_start if not provided"
-            t_zeros = th.zeros((x_0.size(0),), dtype=th.long, device=x_0.device)
-            encoding = self.encode(x_0, t_zeros)
-            z_0 = encoding["encoding"]
-            model_kwargs["encoding"] = encoding  # Store mu/logvar for KL loss
-        else:
-            encoding = None  # Already provided
-        # for name, param in self.encoder_unet_model.named_parameters():
-        #     if not param.requires_grad:
-        #         print(f"[Frozen] {name}")
-        # for name, param in self.encoder_unet_model.named_parameters():
-        #     if param.grad is not None:
-        #         print(f"Grad norm for {name}: {param.grad.norm().item()}")
-
-        latent_posterior_score = self.guidance_score(x_t, t, z=z_0)
-
+        
+        assert z_0 is not None, 'Need z_start to condition when training'
+        
+        # Get unconditional score from the pretrained model (no gradients needed)
         with th.no_grad():
-            data_prior_noise = self.unet_model(x_t, t)
-
-        conditional_noise = data_prior_noise - self.sigmas.to(t.device)[t] * guidance_scale * latent_posterior_score
-
-        # Cleanup (optional)
+            unconditional_score = self.unet_model(x_t, t)
+        
+        guidance_gradients = self.guidance_score(x_t=x_t, t=t, z=z_0)
+        
+        # Apply noise level scaling and guidance strength
+        sigma_t = self.sigmas.to(t.device)[t].view(-1, 1, 1, 1)
+        scaled_guidance = sigma_t * guidance_scale * guidance_gradients
+        
+        # Combine with unconditional score
+        conditional_score = unconditional_score - scaled_guidance
+        
+        if self.debug:
+            print(f"DEBUG in forward:")
+            # print(f"  - mu range: [{mu.min().item()}, {mu.max().item()}]")
+            # print(f"  - log_var range: [{log_var.min().item()}, {log_var.max().item()}]")
+            # print(f"  - log_density: {log_density.mean().item()}")
+            print(f"  - guidance_gradients norm: {guidance_gradients.norm().item()}")
+            print(f"  - scaled_guidance norm: {scaled_guidance.norm().item()}")
+            print(f"  - unconditional_score norm: {unconditional_score.norm().item()}")
+            print(f"  - conditional_score norm: {conditional_score.norm().item()}")
+        
+        # Store for sampling if needed
         if self.sampling:
-            # del data_prior_noise, latent_posterior_score
-            # th.cuda.empty_cache()
-            self.sample_encoding["prior_score"].append(-data_prior_noise/self.sigmas.to(t.device)[t])
-            self.sample_encoding["conditional_score"].append(latent_posterior_score)
+            self.sample_encoding["prior_score"].append(-unconditional_score/sigma_t)
+            self.sample_encoding["conditional_score"].append(guidance_gradients)
+        
+        return conditional_score
+    
+    def guidance_score(self, x_t, t, z):
+        x_t.requires_grad_(True)
+        
+        if self.sampling:
+            th.set_grad_enabled(True)
+        # Get latent distribution parameters from encoder
+        latent_params = self.encoder_unet_model(x_t, t)
+        
+        # Split the output into mean and log variance
+        mu, log_var = latent_params.chunk(2, dim=1)
+        
+        # Compute log density (negative energy) of z_0 under q(z|x_t)
+        z_flat = z.reshape(z.size(0), -1)
+        mu_flat = mu.reshape(mu.size(0), -1)
+        log_var_flat = log_var.reshape(log_var.size(0), -1)
+        
+        # Terms inside the sum for log density
+        precision = (-log_var_flat).exp()  # 1/variance
+        diff_squared = (z_flat - mu_flat).pow(2)
+        
+        # We need gradients to flow from these terms back to the encoder parameters
+        log_density_terms = -0.5 * (diff_squared * precision + log_var_flat)
+        log_density = log_density_terms.sum(dim=1)
+        # Clear intermediate tensors that are not needed after computation
+        del latent_params, mu, log_var, z_flat, mu_flat, log_var_flat, precision, diff_squared, log_density_terms
 
-        return conditional_noise
+        # Clear the cache to release unused memory
+        th.cuda.empty_cache()
+        # Compute gradient of log density w.r.t. x_t
+        # This is where the magic happens - we use autograd to get ∇_x log q(z|x_t)
+        grad_outputs = th.ones_like(log_density)
+        return th.autograd.grad(
+            outputs=log_density,
+            inputs=x_t,
+            grad_outputs=grad_outputs,
+            create_graph=not self.sampling,  # Crucial for higher-order gradients
+            retain_graph=not self.sampling,
+        )[0]
+        
+        
     
     def encode(self, x_t, t):
-        """
-        Encoder network to compute latent posterior parameters and sample z.
-
-        :param x_t: Input tensor (x_t).
-        :param t: Time step tensor.
-        :return: Dictionary with latent variables and distributions.
-        """
-        mean_z, log_var_z = self.encoder_unet_model(x_t, t).chunk(2)
-        # Reparameterization trick
-        cond = mean_z + (0.5 * log_var_z).exp() * th.randn_like(mean_z)
-
+        """Encode x_t to get latent distribution parameters and sample z."""
+        latent_distribution_parameters = self.encoder_unet_model(x_t, t)
+        mean_z, log_var_z = latent_distribution_parameters.chunk(2, dim=1)
+        
+        # Reparameterization trick for sampling
+        std = (0.5 * log_var_z).exp()
+        eps = th.randn_like(mean_z)
+        cond = mean_z + std * eps
+        
         return {
             'encoding': cond,
             'mu': mean_z,
             'logvar': log_var_z
         }
-
-    def guidance_score(self, x_t, t, z):
-        # Ensure x_t is a leaf with grad enabled
-        x_t = x_t.clone().detach().requires_grad_(True)
-
-        # Run encoder with grad enabled so mu/log_var depend on x_t
-        with th.set_grad_enabled(True):
-            latent_sample = self.encode(x_t, t)
-            mu = latent_sample["mu"]
-            log_var = latent_sample["logvar"]
-
-            # Compute log density of z under q(z | x_t)
-            log_q = self.log_density(z, mu, log_var) + 1e-8
-
-            # Compute gradient of log_q w.r.t. x_t
-            score = th.autograd.grad(
-                outputs=log_q,
-                inputs=x_t,
-                grad_outputs=th.ones_like(log_q),
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True
-            )[0]
-
-        return score 
-        # del log_q, mu, log_var, latent_sample
-
-    def log_density(self, z, mu, log_var):
-        """
-        Compute the log density of the latent posterior q(z|xt).
-
-        :param x_t: Input tensor (x_t).
-        :param z: Latent variable.
-        :param t: Time step tensor.
-        :return: Log density of q(z|xt).
-        """
-        return -0.5 * th.sum(
-            th.square(
-                z.view(mu.size(0), -1) - mu.view(mu.size(0), -1)
-                ) / log_var.view(log_var.size(0), -1).exp() + log_var.view(log_var.size(0), -1), 
-            dim=1
-            )
     
+    def log_density(self, z, mu, log_var):
+        """Compute log density of z under q(z|x_t)."""
+        z_flat = z.reshape(z.size(0), -1)
+        mu_flat = mu.reshape(mu.size(0), -1)
+        log_var_flat = log_var.reshape(log_var.size(0), -1)
+        
+        return -0.5 * th.sum(
+            (z_flat - mu_flat).pow(2) / log_var_flat.exp() + log_var_flat,
+            dim=1
+        )

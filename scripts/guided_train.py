@@ -26,7 +26,7 @@ def main():
 
     model, diffusion = create_guided_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys()),
-        unet_ckpt=args.unet_ckpt  # Pass unet_ckpt explicitly
+        unet_ckpt=args.unet_ckpt,  # Pass unet_ckpt explicitly
     )
     model.to(dist_util.dev())
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
@@ -50,7 +50,7 @@ def main():
         ema_rate=args.ema_rate,
         log_interval=args.log_interval,
         save_interval=args.save_interval,
-        resume_checkpoint=args.resume_checkpoint,
+        resume_checkpoint=False,
         use_fp16=args.use_fp16,
         fp16_scale_growth=args.fp16_scale_growth,
         schedule_sampler=schedule_sampler,
@@ -65,10 +65,10 @@ def create_argparser():
         log_dir="/home/rg625/models/conditional/cifar10",
         image_size=32,
         schedule_sampler="uniform",
-        lr=1e-4,
+        lr=1e-3,
         weight_decay=0.0,
-        lr_anneal_steps=100,
-        batch_size=256,
+        lr_anneal_steps=0,
+        batch_size=128,
         microbatch=-1,  # -1 disables microbatches
         ema_rate="0.9999",  # comma-separated list of EMA values
         log_interval=10,
@@ -76,7 +76,9 @@ def create_argparser():
         resume_checkpoint="",
         use_fp16=False,
         fp16_scale_growth=1e-3,
-        unet_ckpt="/home/rg625/models/unconditional/cifar10/ema_0.9999_200000.pt"
+        unet_ckpt="/home/rg625/models/unconditional/cifar10/ema_0.9999_200000.pt",
+        use_checkpoint=False,
+
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()
