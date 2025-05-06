@@ -167,7 +167,10 @@ class GaussianDiffusion:
             * np.sqrt(alphas)
             / (1.0 - self.alphas_cumprod)
         )
-
+        self.sample_encoding = {
+            "prior_score": [],
+            "conditional_score": [],
+        }
     def q_mean_variance(self, x_start, t):
         """
         Get the distribution q(x_t | x_0).
@@ -363,6 +366,7 @@ class GaussianDiffusion:
         This uses the conditioning strategy from Sohl-Dickstein et al. (2015).
         """
         gradient = cond_fn(x, self._scale_timesteps(t), **model_kwargs)
+        self.sample_encoding["conditional_score"].append(gradient.detach())
         new_mean = (
             p_mean_var["mean"].float() + p_mean_var["variance"] * gradient.float()
         )
@@ -431,6 +435,7 @@ class GaussianDiffusion:
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
+        self.sample_encoding["prior_score"].append(-out["mean"].detach()/th.from_numpy(self.sqrt_one_minus_alphas_cumprod).to(t.device)[t].view(-1, 1, 1, 1))
         if cond_fn is not None:
             out["mean"] = self.condition_mean(
                 cond_fn, out, x, t, model_kwargs=model_kwargs

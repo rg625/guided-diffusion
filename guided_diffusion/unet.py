@@ -857,7 +857,8 @@ class EncoderUNetModel(nn.Module):
         else:
             raise NotImplementedError(f"Unexpected {pool} pooling")
         
-        self.projection = nn.Linear(self._feature_size, 1024)
+        self.mu = nn.Linear(self._feature_size, 512)
+        self.logvar = nn.Linear(self._feature_size, 512)
         
     def convert_to_fp16(self):
         """
@@ -894,57 +895,69 @@ class EncoderUNetModel(nn.Module):
             results.append(h.type(x.dtype).mean(dim=(2, 3)))
             h = th.cat(results, axis=-1)
             h = self.out(h)
-            return self.projection(h)
+            return self.mu(h), self.logvar(h)
         else:
             h = h.type(x.dtype)
             h = self.out(h)
-            return self.projection(h)
+            return self.mu(h), self.logvar(h)
         
 
-class ScoreVAE(th.nn.Module):
+class ScoreVAE(nn.Module):
     """
     A ScoreVAE model with direct integration between the encoder and guidance.
+    Improved gradient flow for the encoder network.
     """
-    def __init__(self, 
-                 unet_model: UNetModel, 
-                 encoder_unet_model: EncoderUNetModel, 
-                 unet_ckpt: str = None, 
-                 sigmas: np.array = None,
-                 debug=False,
-                 **kwargs):
+    def __init__(
+        self,
+        unet_model,
+        encoder_unet_model,
+        unet_ckpt=None,
+        sigmas=None,
+        debug=False,
+        **kwargs
+    ):
         super().__init__()
-
-        self.unet_model: UNetModel = unet_model
-        self.encoder_unet_model: EncoderUNetModel = encoder_unet_model
-        self.sigmas = th.from_numpy(sigmas).float().view(-1, 1, 1, 1)
+        self.unet_model = unet_model
+        self.encoder_unet_model = encoder_unet_model
+        self.sigmas = th.from_numpy(sigmas).float().view(-1, 1, 1, 1) if sigmas is not None else None
         self.sampling = False
         self.debug = debug
         self.sample_encoding = {
             "prior_score": [],
             "conditional_score": [],
         }
-
+        
+        # Load pretrained weights for the unconditional model
         if unet_ckpt is not None:
             self.load_pretrained(unet_ckpt)
-            # Freeze the unconditional model parameters
+            # Freeze the unconditional model weights
             for param in self.unet_model.parameters():
                 param.requires_grad = False
         else:
             raise ValueError("Cannot train encoder without a pretrained unconditional model")
         
-        # Copy the time embedding layer from the unconditional model
+        # IMPORTANT: Ensure the encoder's time embedding is properly initialized
+        # Copy the time embedding from the pre-trained UNet for feature consistency
         self.encoder_unet_model.time_embed = copy.deepcopy(self.unet_model.time_embed)
         
-        # Ensure encoder parameters are trainable
+        # Make sure all encoder parameters are trainable
         for param in self.encoder_unet_model.parameters():
             param.requires_grad = True
-
+        
+        # Log encoder architecture details during initialization
+        if debug:
+            print(f"\nEncoder initialization:")
+            print(f"  Output feature size: {self.encoder_unet_model._feature_size}")
+            print(f"  Attention resolutions: {self.encoder_unet_model.attention_resolutions}")
+            print(f"  Channel multipliers: {self.encoder_unet_model.channel_mult}")
+            print(f"  Total parameters: {sum(p.numel() for p in self.encoder_unet_model.parameters())}")
+            
     def load_pretrained(self, path):
         """Load pretrained weights for the unconditional model."""
         state = th.load(path, map_location="cpu")
         print(f"Loading pretrained weights from {path}, step: {state.get('global_step', 'N/A')}")
         self.unet_model.load_state_dict(state, strict=True)
- 
+        
     def prepare_for_sampling(self, x_0):
         """Prepare for sampling by encoding x_0."""
         t_zeros = th.zeros((x_0.size(0),), dtype=th.long, device=x_0.device)
@@ -958,97 +971,110 @@ class ScoreVAE(th.nn.Module):
     def forward(self, x_t, t, **model_kwargs):
         """
         Combined forward pass for the ScoreVAE model.
-        
-        This implementation directly computes both the unconditional score and the
-        guidance term in a single forward pass, ensuring proper gradient flow.
+        Returns the guidance gradients.
         """
-        guidance_scale = model_kwargs.get("guidance_scale", 1.0)
+        # guidance_scale = model_kwargs.get("guidance_scale", 1.0)
         z_0 = model_kwargs.get('z_start', None)
         
-        assert z_0 is not None, 'Need z_start to condition when training'
+        if z_0 is None:
+            raise ValueError('Need z_start to condition when training')
         
-        # # Get unconditional score from the pretrained model (no gradients needed)
-        # with th.no_grad():
-        #     unconditional_score = self.unet_model(x_t, t)
+        # Calculate guidance gradients - this is where the encoder gradient flow begins
+        guidance_gradients = self.guidance_score(x_t=x_t, t=t, z=z_0)
         
-        # guidance_gradients = self.guidance_score(x_t=x_t, t=t, z=z_0)
+        # Normalize gradients for stability (optional)
+        # gradient_norm = guidance_gradients.norm(dim=(1,2,3), keepdim=True) + 1e-8
+        # guidance_gradients = guidance_gradients / gradient_norm
         
-        # # Apply noise level scaling and guidance strength
-        # sigma_t = self.sigmas.to(t.device)[t].view(-1, 1, 1, 1)
-        # scaled_guidance = sigma_t * guidance_scale * guidance_gradients
+        if self.sampling:
+            self.sample_encoding["conditional_score"].append(guidance_gradients.detach())
+            
+        # Return guidance gradients
+        return guidance_gradients
         
-        # # Combine with unconditional score
-        # conditional_score = unconditional_score - scaled_guidance
-        
-        # if self.debug:
-        #     print(f"DEBUG in forward:")
-        #     # print(f"  - mu range: [{mu.min().item()}, {mu.max().item()}]")
-        #     # print(f"  - log_var range: [{log_var.min().item()}, {log_var.max().item()}]")
-        #     # print(f"  - log_density: {log_density.mean().item()}")
-        #     print(f"  - guidance_gradients norm: {guidance_gradients.norm().item()}")
-        #     print(f"  - scaled_guidance norm: {scaled_guidance.norm().item()}")
-        #     print(f"  - unconditional_score norm: {unconditional_score.norm().item()}")
-        #     print(f"  - conditional_score norm: {conditional_score.norm().item()}")
-        
-        # # Store for sampling if needed
-        # if self.sampling:
-        #     self.sample_encoding["prior_score"].append(-unconditional_score/sigma_t)
-        #     self.sample_encoding["conditional_score"].append(guidance_gradients)
-        
-        return guidance_scale * self.guidance_score(x_t=x_t, t=t, z=z_0)
-    
     def guidance_score(self, x_t, t, z):
+        """
+        Compute guidance score with improved gradient flow.
+        This calculates gradients of log p(z|x_t) with respect to x_t.
+        """
+        # Set requires_grad for backpropagation
         x_t.requires_grad_(True)
         
+        # Temporarily enable gradients for sampling if needed
         if self.sampling:
             th.set_grad_enabled(True)
-        # Get latent distribution parameters from encoder
-        latent_params = self.encoder_unet_model(x_t, t)
         
-        # Split the output into mean and log variance
-        mu, log_var = latent_params.chunk(2, dim=1)
+        # Forward pass through encoder to get distribution parameters
+        mu, log_var = self.encoder_unet_model(x_t, t)
         
-        # We need gradients to flow from these terms back to the encoder parameters
-        log_density =self.log_density(z=z, mu=mu, log_var=log_var)
-        # Clear intermediate tensors that are not needed after computation
-        del latent_params, mu, log_var
-
-        # Clear the cache to release unused memory
+        # Normalize and clamp variance for stability
+        log_var = th.clamp(log_var, min=-5.0, max=5.0)
+        
+        # Debug logging - only when debug mode is enabled
+        if self.debug:
+            print(f'mu norm: {mu.norm(2, dim=1).mean().item()}')
+            print(f'log_var mean: {log_var.mean().item()}')
+        
+        # Calculate log probability density
+        log_density = self.log_density(z=z, mu=mu, log_var=log_var)
+        
+        # Clean up memory in sampling mode
         if self.sampling:
             th.cuda.empty_cache()
-        # Compute gradient of log density w.r.t. x_t
-        grad_outputs = th.ones_like(log_density)
-        return th.autograd.grad(
+        
+        # Calculate gradients of log density with respect to x_t
+        gradients = th.autograd.grad(
             outputs=log_density,
             inputs=x_t,
-            grad_outputs=grad_outputs,
+            grad_outputs=th.ones_like(log_density),
             create_graph=not self.sampling,
             retain_graph=not self.sampling,
         )[0]
-    
+        
+        return gradients
+        
     def encode(self, x_t, t):
-        """Encode x_t to get latent distribution parameters and sample z."""
-        latent_distribution_parameters = self.encoder_unet_model(x_t, t)
-        mean_z, log_var_z = latent_distribution_parameters.chunk(2, dim=1)
+        """
+        Encode x_t to get latent distribution parameters and sample z.
+        Returns the latent encoding and distribution parameters.
+        """
+        # Get mean and log variance from encoder
+        mean_z, log_var_z = self.encoder_unet_model(x_t, t)
         
-        # Reparameterization trick for sampling
-        std = (0.5 * log_var_z).exp()
+        # Sample from the latent distribution using reparameterization trick
+        std_z = th.exp(0.5 * log_var_z)
         eps = th.randn_like(mean_z)
-        cond = mean_z + std * eps
+        cond = mean_z + eps * std_z
         
+        # Return encoding with distribution parameters
         return {
-            'encoding': cond,
+            'encoding': cond.requires_grad_(True),
             'mu': mean_z,
             'logvar': log_var_z
         }
     
     def log_density(self, z, mu, log_var):
-        """Compute log density of z under q(z|x_t)."""
-        z_flat = z.reshape(z.size(0), -1)
-        mu_flat = mu.reshape(mu.size(0), -1)
-        log_var_flat = log_var.reshape(log_var.size(0), -1)
+        """
+        Compute log density of z under q(z|x_t).
+        Properly normalized multivariate Gaussian log likelihood.
+        """
+        # Standard formula for log probability density of multivariate Gaussian
+        # log(p(z|x_t)) = -0.5 * (log(2π) + log(σ²) + (z-μ)²/σ²)
         
-        return -0.5 * th.sum(
-            (z_flat - mu_flat).pow(2) / log_var_flat.exp() + log_var_flat,
-            dim=1
+        # Compute normalized log density for more numerically stable calculations
+        # and to ensure proper gradient scaling
+        d = z.shape[1]  # Dimension of latent space
+        log_2pi = th.log(th.tensor(2.0 * math.pi))
+        
+        # Normalized log density computation
+        precision = th.exp(-log_var)
+        
+        # Formula for multivariate Gaussian log likelihood
+        log_prob = -0.5 * (
+            log_2pi * d + 
+            th.sum(log_var, dim=1) + 
+            th.sum((z - mu).pow(2) * precision, dim=1)
         )
+        
+        return log_prob
+    

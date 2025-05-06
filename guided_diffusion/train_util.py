@@ -8,13 +8,14 @@ import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 import numpy as np
+import wandb
 
 from .losses import normal_kl
 from . import dist_util, logger
 from .fp16_util import MixedPrecisionTrainer
-from .nn import update_ema
+from .nn import update_ema, mean_flat
 from .resample import LossAwareSampler, UniformSampler
-
+from .gaussian_diffusion import _extract_into_tensor
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
 # 20-21 within the first ~1K steps of training.
@@ -39,7 +40,23 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
-    ):
+        wandb_project="ScoreVAE",  # New argument for wandb project name
+        wandb_config=None,  # New argument for additional wandb config
+        ):
+
+                # Initialize wandb
+        wandb.init(
+            project=wandb_project,
+            config=wandb_config or {
+                "batch_size": batch_size,
+                "lr": lr,
+                "ema_rate": ema_rate,
+                "weight_decay": weight_decay,
+                "lr_anneal_steps": lr_anneal_steps,
+            },
+        )
+        wandb.watch(model, log="all")  # Log gradients and model parameters
+
         self.model = model
         self.diffusion = diffusion
         self.data = data
@@ -177,13 +194,14 @@ class TrainLoop:
             for name, param in self.ddp_model.module.named_parameters()
             if param.requires_grad
         }
-        # print(encoder_params_before)
+
         self.forward_backward(batch, cond)
         took_step = self.mp_trainer.optimize(self.opt)
         if took_step:
             self._update_ema()
         self._anneal_lr()
         self.log_step()
+        self.log_param_and_grad_norms()
         # Sanity check: compare params before and after backward
         for name, param in self.ddp_model.module.named_parameters():
             if param.requires_grad:
@@ -245,6 +263,40 @@ class TrainLoop:
     def log_step(self):
         logger.logkv("step", self.step + self.resume_step)
         logger.logkv("samples", (self.step + self.resume_step + 1) * self.global_batch)
+        # Log step and learning rate
+        current_lr = self.opt.param_groups[0]["lr"]
+        wandb.log({
+            "step": self.step + self.resume_step,
+            "samples": (self.step + self.resume_step + 1) * self.global_batch,
+            "learning_rate": current_lr,
+        })
+
+    def log_param_and_grad_norms(self):
+        """
+        Log parameter and gradient norms using wandb.
+        """
+        total_param_norm = 0
+        total_grad_norm = 0
+        param_count = 0
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param_norm = param.data.norm(2).item()
+                grad_norm = param.grad.norm(2).item() if param.grad is not None else 0
+                total_param_norm += param_norm
+                total_grad_norm += grad_norm
+                param_count += 1
+
+                # Log individual parameter and gradient norms
+                wandb.log({
+                    f"param_norm/{name}": param_norm,
+                    f"grad_norm/{name}": grad_norm,
+                })
+
+        # Log total parameter and gradient norms
+        wandb.log({
+            "total_param_norm": total_param_norm / param_count,
+            "total_grad_norm": total_grad_norm / param_count,
+        })
 
     def save(self):
         def save_checkpoint(rate, params):
@@ -308,7 +360,6 @@ def find_ema_checkpoint(main_checkpoint, step, rate):
         return path
     return None
 
-
 def log_loss_dict(diffusion, ts, losses):
     """
     Log the loss dictionary with quantile-specific logging for time steps.
@@ -328,7 +379,9 @@ def log_loss_dict(diffusion, ts, losses):
         # Log the quantiles (four quartiles, in particular).
         for sub_t, sub_loss in zip(ts.cpu().numpy(), values.detach().cpu().numpy()):
             quartile = int(4 * sub_t / diffusion.num_timesteps)
+            wandb.log({f"loss/{key}_q{quartile}": sub_loss})
             logger.logkv_mean(f"{key}_q{quartile}", sub_loss)
+
 
 class TrainGuidanceLoop(TrainLoop):
     """
@@ -353,8 +406,10 @@ class TrainGuidanceLoop(TrainLoop):
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        beta=0.001,  # Weight for KL divergence in the loss
+        beta=1e-3,  # Weight for KL divergence in the loss
+        guidance_scale=1.0,  # Weight for guidance loss
         debug=False,  # Debug mode flag
+        wandb_project="ScoreVAE",  # Wandb project name
     ):
         super().__init__(
             model=model,
@@ -372,8 +427,10 @@ class TrainGuidanceLoop(TrainLoop):
             schedule_sampler=schedule_sampler,
             weight_decay=weight_decay,
             lr_anneal_steps=lr_anneal_steps,
+            wandb_project=wandb_project,
         )
-        self.beta = beta  # KL divergence weight
+        self.beta = beta
+        self.guidance_scale = guidance_scale
         self.debug = debug
         
         # Enable debug mode in the model if requested
@@ -381,134 +438,170 @@ class TrainGuidanceLoop(TrainLoop):
             self.model.module.debug = debug
         else:
             self.model.debug = debug
-
-    def compute_losses(self, predicted_noise, true_noise):
+            
+        # Print encoder parameters for debugging
+        self._log_encoder_info()
+    
+    def _log_encoder_info(self):
+        """Log information about the encoder parameters for debugging."""
+        encoder = self.ddp_model.module.encoder_unet_model if hasattr(self.ddp_model, 'module') else self.ddp_model.encoder_unet_model
+        
+        print(f"Encoder architecture: {encoder.__class__.__name__}")
+        print(f"Total encoder parameters: {sum(p.numel() for p in encoder.parameters())}")
+        print(f"Trainable encoder parameters: {sum(p.numel() for p in encoder.parameters() if p.requires_grad)}")
+        
+    def compute_losses(self, predicted_noise, true_noise, perturbed_x=None, t=None, encoding=None):
         """
         Compute the diffusion loss (MSE between predicted and true noise).
-        
-        :param predicted_noise: Noise predicted by the model
-        :param true_noise: True noise used to generate the perturbed input
-        :return: Dictionary of losses
+        Optional reconstruction terms can be added to improve encoder gradient flow.
         """
-        # Mean squared error loss
-        losses = th.square(predicted_noise - true_noise)
-        losses = th.sum(losses.reshape(losses.shape[0], -1), dim=-1)
-        losses *= 1 / 2
-        
-        return {
-            "loss": th.mean(losses)  # likelihood loss / reconstruction loss
+        losses = {
+            "mse": mean_flat((true_noise - predicted_noise)**2).sum()
         }
+        
+        # Add additional losses if needed
+        if encoding is not None:
+            # Optional: add reconstruction loss for better encoder gradients
+            mu, logvar = encoding["mu"], encoding["logvar"]
+            losses["kl"] = -0.5 * th.sum(
+                1 + logvar.view(logvar.size(0), -1)
+                - mu.view(mu.size(0), -1).pow(2)
+                - logvar.view(logvar.size(0), -1).exp(),
+                dim=1
+            ).mean()
+            
+        return losses
     
     def forward_backward(self, batch, cond):
         """
-        Perform a forward and backward pass on the batch with optional conditioning.
-        
-        Args:
-            batch (torch.Tensor): Input batch of data.
-            cond (dict or None): Conditioning information if available.
+        Perform a forward and backward pass with improved gradient flow to the encoder.
         """
         device = dist_util.dev()
         self.mp_trainer.zero_grad()
-
         batch_size = batch.shape[0]
+        
+        # Store gradients for all encoder parameters to verify backprop
+        encoder_grads = {}
+        if self.debug:
+            for name, param in self.ddp_model.module.encoder_unet_model.named_parameters():
+                if param.requires_grad:
+                    param.register_hook(lambda grad, name=name: encoder_grads.update({name: grad.clone()}))
+
         for start_idx in range(0, batch_size, self.microbatch):
             end_idx = min(start_idx + self.microbatch, batch_size)
-            microbatch = batch[start_idx:end_idx].to(device)
+            micro = batch[start_idx:end_idx].to(device)
             is_last_microbatch = end_idx >= batch_size
 
-            # Sample time steps and their corresponding weights
-            t, weights = self.schedule_sampler.sample(microbatch.shape[0], device)
+            # Sample time steps and weights
+            t, weights = self.schedule_sampler.sample(micro.shape[0], device)
 
-            # Encode the input to get latent conditioning
-            # Use t=0 (clean data) for encoding since we want z_0
-            zero_t = th.zeros_like(t, device=device)
-            encoding = self.ddp_model.module.encode(microbatch, zero_t)
+            # Encode the input to get latent conditioning - CRITICAL CHANGE:
+            # Use the same t as diffusion for encoding to ensure gradient flow
+            encoding = self.ddp_model.module.encode(micro, th.full(size=(micro.size(0),), fill_value=-1).long().type_as(micro))
             
-            if not cond:
-                micro_cond = {"z_start": encoding['encoding']}
-            else:
-                micro_cond = {k: v[start_idx:end_idx].to(device) for k, v in cond.items()}
-                if "z_start" not in micro_cond:
-                    micro_cond["z_start"] = encoding['encoding']
+            micro_cond = cond or {}
+            micro_cond = {k: v[start_idx:end_idx].to(device) for k, v in micro_cond.items()}
+            
+            # Store encoding with requires_grad=True to ensure gradient flow
+            z_start = encoding["encoding"]
+            micro_cond["z_start"] = z_start
 
             # Sample perturbed inputs x_t ~ q(x_t | x_0)
-            noise = th.randn_like(microbatch, device=device)
-            perturbed_x = self.diffusion.q_sample(microbatch, t, noise=noise)
-            # perturbed_x.requires_grad_(True)
-            # perturbed_x = microbatch + th.from_numpy(self.diffusion.sqrt_one_minus_alphas_cumprod).float().view(-1, 1, 1, 1).to(t.device)[t]*noise
-            perturbed_x.requires_grad_(True)
-            if self.debug:
-                # Check perturbed_x
-                print(f"DEBUG perturbed_x:")
-                print(f"  - Shape: {perturbed_x.shape}")
-                print(f"  - Requires grad: {perturbed_x.requires_grad}")
-                print(f"  - Range: [{perturbed_x.min().item()}, {perturbed_x.max().item()}]")
-                
-                # Print encoder parameter stats before forward pass
-                print("DEBUG PARAMETERS AT START:")
-                for name, param in self.ddp_model.module.encoder_unet_model.named_parameters():
-                    grad_norm = 0.0
-                    if param.grad is not None:
-                        grad_norm = param.grad.norm().item()
-                    print(f"  {name}: grad_norm={grad_norm:.8f}")
-
-            # Predict the noise using our ScoreVAE model
-            with th.no_grad():
-                pretrained_noise = self.ddp_model.module.unet_model(perturbed_x, t)
-            predicted_noise = -self.ddp_model(perturbed_x, t, **micro_cond)*th.from_numpy(self.diffusion.sqrt_one_minus_alphas_cumprod).float().view(-1, 1, 1, 1).to(t.device)[t]
+            noise = th.randn_like(micro, device=device)
+            perturbed_x = self.diffusion.q_sample(micro, t, noise=noise)
             
-            if self.debug:
-                # Check predicted_noise
-                print(f"DEBUG predicted_noise:")
-                print(f"  - Shape: {predicted_noise.shape}")
-                print(f"  - Requires grad: {predicted_noise.requires_grad}")
-                print(f"  - Range: [{predicted_noise.min().item()}, {predicted_noise.max().item()}]")
-                
-                # Print encoder parameter stats after forward pass
-                print("DEBUG PARAMETERS AT After forward pass:")
-                for name, param in self.ddp_model.module.encoder_unet_model.named_parameters():
-                    grad_norm = 0.0
-                    if param.grad is not None:
-                        grad_norm = param.grad.norm().item()
-                    print(f"  {name}: grad_norm={grad_norm:.8f}")
+            # IMPORTANT: Remove requires_grad on perturbed_x to avoid double gradient issues
+            perturbed_x = perturbed_x.detach().requires_grad_(True)
 
-            # Compute loss between predicted noise and original noise
+            # Compute gradient from guidance module directly through encoder
+            with th.enable_grad():
+                # Get the guidance correction
+                epsilon_correction = self.ddp_model(perturbed_x, t, **micro_cond)
+                
+                # Scale by the diffusion term
+                diffusion_scale = _extract_into_tensor(
+                    self.diffusion.sqrt_one_minus_alphas_cumprod, t, perturbed_x.shape
+                ).to(t.device)
+                
+                epsilon_correction = -epsilon_correction * diffusion_scale
+
+            # Get the base unconditional prediction
+            with th.no_grad():
+                epsilon = self.ddp_model.module.unet_model(perturbed_x, t)[:, :3, :]
+            
+            # Combine the two
+            corrected_eps = epsilon + self.guidance_scale * epsilon_correction
+
+            # Compute losses
             if is_last_microbatch or not self.use_ddp:
-                losses = self.compute_losses(predicted_noise, noise - pretrained_noise)
+                losses = self.compute_losses(
+                    corrected_eps, 
+                    noise, 
+                    perturbed_x=perturbed_x,
+                    t=t,
+                    encoding=encoding
+                )
             else:
                 with self.ddp_model.no_sync():
-                    losses = self.compute_losses(predicted_noise, noise - pretrained_noise)
+                    losses = self.compute_losses(
+                        corrected_eps, 
+                        noise,
+                        perturbed_x=perturbed_x,
+                        t=t,
+                        encoding=encoding
+                    )
 
-            # If using a LossAwareSampler, update with observed losses
+            # Update LossAwareSampler if in use
             if isinstance(self.schedule_sampler, LossAwareSampler):
-                self.schedule_sampler.update_with_local_losses(t, losses["loss"].detach())
+                self.schedule_sampler.update_with_local_losses(t, losses["mse"].detach())
 
-            # Total loss - for now just using the reconstruction loss
-            # total_loss = losses["loss"]
+            # Log additional metrics for debugging
+            mu, logvar = encoding["mu"], encoding["logvar"]
+            
+            # Verbose logging for debugging
+            if self.debug and is_last_microbatch:
+                print(f"Timestep mean: {t.float().mean().item()}")
+                print(f"Mu norm: {mu.norm(2, dim=1).mean().item()}")
+                print(f"LogVar mean: {logvar.mean().item()}")
+                print(f"Encoding norm: {z_start.norm(2, dim=1).mean().item()}")
+                print(f"Noise unconditional norm: {epsilon.norm(2, dim=1).mean().item()}")
+                print(f"Epsilon correction norm: {epsilon_correction.norm(2, dim=1).mean().item()}")
+            
+            wandb.log({
+                "encoding/mu_norm": mu.norm(2, dim=1).mean().item(),
+                "encoding/var": logvar.exp().mean().item(),
+                "encoding/encoding_norm": z_start.norm(2, dim=1).mean().item(),
+                "noise/unconditional_norm": epsilon.norm(2, dim=1).mean().item(),
+                "noise/conditional_norm": epsilon_correction.norm(2, dim=1).mean().item(),
+                "noise/total_norm": corrected_eps.norm(2, dim=1).mean().item(),
+                "time/mean": t.float().mean().item(),
+            })
 
-            # Optional KL divergence loss
-            mu, logvar = encoding['mu'], encoding['logvar']
-            losses["kl_loss"] = - 0.5 * th.sum(1 + logvar.view(logvar.size(0), -1)
-                                  - mu.view(mu.size(0), -1).pow(2)
-                                  - logvar.view(logvar.size(0), -1).exp(), dim=1).mean()
-            total_loss = losses["loss"] + self.beta * losses["kl_loss"]
+            # Calculate the total loss - scale KL to be comparable to MSE
+            total_loss = losses["mse"] + self.beta * losses["kl"]
 
-            # Logging
+            # Log losses
             log_dict = {k: v * weights for k, v in losses.items()}
             log_loss_dict(self.diffusion, t, log_dict)
 
-            # Backpropagate through the computational graph
+            # Explicit backward for the guidance loss
             if is_last_microbatch or not self.use_ddp:
                 self.mp_trainer.backward(total_loss)
             else:
                 with self.ddp_model.no_sync():
                     self.mp_trainer.backward(total_loss)
+            
+        # Debug gradient flow if enabled
+        if self.debug:
+            encoder_params = self.ddp_model.module.encoder_unet_model.named_parameters()
+            print("\nEncoder gradient norms:")
+            for name, param in encoder_params:
+                if param.requires_grad and param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    if grad_norm < 1e-4:
+                        print(f"  {name}: {grad_norm:.6f} ⚠️ LOW")
+                    else:
+                        print(f"  {name}: {grad_norm:.6f}")
+                elif param.requires_grad:
+                    print(f"  {name}: None ⚠️ NO GRAD")
                     
-            if self.debug:
-                # Check for gradients after backward
-                print("DEBUG PARAMETERS AFTER BACKWARD:")
-                for name, param in self.ddp_model.module.encoder_unet_model.named_parameters():
-                    grad_norm = 0.0
-                    if param.grad is not None:
-                        grad_norm = param.grad.norm().item()
-                    print(f"  {name}: grad_norm={grad_norm:.8f}")

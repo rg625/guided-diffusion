@@ -5,3 +5,11 @@ classify_image_graph_def.pb
 *.ipynb
 *.egg-info
 *.png
+*.wandb
+*.json
+*.log
+*.yaml
+
+
+**/wandb/latest-run
+**/wandb/settings
