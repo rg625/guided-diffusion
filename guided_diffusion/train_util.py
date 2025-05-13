@@ -406,7 +406,7 @@ class TrainGuidanceLoop(TrainLoop):
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        beta=1e-3,  # Weight for KL divergence in the loss
+        beta=1e-6,  # Weight for KL divergence in the loss
         guidance_scale=1.0,  # Weight for guidance loss
         debug=False,  # Debug mode flag
         wandb_project="ScoreVAE",  # Wandb project name
@@ -432,7 +432,8 @@ class TrainGuidanceLoop(TrainLoop):
         self.beta = beta
         self.guidance_scale = guidance_scale
         self.debug = debug
-        
+        print("Using resume checkpoint:", resume_checkpoint)
+        print("Exists:", os.path.exists(resume_checkpoint))
         # Enable debug mode in the model if requested
         if hasattr(self.model, 'module'):
             self.model.module.debug = debug

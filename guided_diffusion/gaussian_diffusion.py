@@ -38,6 +38,12 @@ def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
             num_diffusion_timesteps,
             lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2,
         )
+    elif schedule_name == "continous_linear":
+        beta_start = 0.0001
+        beta_end = 0.02
+        return lambda t: th.exp(-0.5 * (beta_start + t * (beta_end - beta_start)) * 1000 * t)
+    elif schedule_name == "continous_cosine":
+        return lambda t: th.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
     else:
         raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
 

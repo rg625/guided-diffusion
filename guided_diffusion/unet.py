@@ -1016,7 +1016,7 @@ class ScoreVAE(nn.Module):
             print(f'log_var mean: {log_var.mean().item()}')
         
         # Calculate log probability density
-        log_density = self.log_density(z=z, mu=mu, log_var=log_var)
+        log_density = self.log_density(z=z.detach(), mu=mu, log_var=log_var)
         
         # Clean up memory in sampling mode
         if self.sampling:
